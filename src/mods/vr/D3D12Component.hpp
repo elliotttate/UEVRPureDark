@@ -25,6 +25,9 @@ class VR;
 namespace vrmod {
 class D3D12Component {
 public:
+    EyeFrameBuffers m_eyeFrameBuffers;
+
+public:
     D3D12Component() 
         : m_openvr{this}
     {
@@ -152,8 +155,8 @@ private:
             ctx.commands.execute();
         }
 
-        std::array<d3d12::TextureContext, 3> left_eye_tex{};
-        std::array<d3d12::TextureContext, 3> right_eye_tex{};
+        std::array<d3d12::TextureContext, 1> left_eye_tex{};
+        std::array<d3d12::TextureContext, 1> right_eye_tex{};
         d3d12::TextureContext ui_tex{};
         uint32_t texture_counter{0};
         D3D12Component* parent{};
@@ -218,7 +221,7 @@ private:
 
     uint32_t m_last_rendered_frame{0};
     bool m_force_reset{true};
-    bool m_last_afr_state{false};
+    bool m_last_native_stereo_state{false};
     bool m_submitted_left_eye{false};
 };
 } // namespace vrmod

@@ -207,14 +207,14 @@ bool D3D11Component::TextureContext::clear_rtv(float* color) {
 }
 
 vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
-    if (m_force_reset || m_last_afr_state != vr->is_using_afr()) {
+    if (m_force_reset || m_last_native_stereo_state != vr->is_using_native_stereo()) {
         if (!setup()) {
             SPDLOG_ERROR_EVERY_N_SEC(1, "Failed to setup D3D11Component, trying again next frame");
             m_force_reset = true;
             return vr::VRCompositorError_None;
         }
 
-        m_last_afr_state = vr->is_using_afr();
+        m_last_native_stereo_state = vr->is_using_native_stereo();
     }
 
     auto& hook = g_framework->get_d3d11_hook();
@@ -259,8 +259,8 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
     const auto is_same_frame = m_last_rendered_frame > 0 && m_last_rendered_frame == vr->m_render_frame_count;
     m_last_rendered_frame = vr->m_render_frame_count;
 
-    const auto is_actually_afr = vr->is_using_afr();
-    const auto is_afr = !is_same_frame && vr->is_using_afr();
+    const auto is_actually_afr = vr->is_using_afr() || vr->is_using_afw();
+    const auto is_afr = !is_same_frame && is_actually_afr;
     const auto is_left_eye_frame = is_afr && vr->m_render_frame_count % 2 == vr->m_left_eye_interval;
     const auto is_right_eye_frame = !is_afr || vr->m_render_frame_count % 2 == vr->m_right_eye_interval;
 
@@ -1048,11 +1048,11 @@ void D3D11Component::on_reset(VR* vr) {
             vr->m_openxr->swapchains.empty() ||
             g_framework->get_d3d11_rt_size()[0] != vr->m_openxr->swapchains[(uint32_t)runtimes::OpenXR::SwapchainIndex::UI].width ||
             g_framework->get_d3d11_rt_size()[1] != vr->m_openxr->swapchains[(uint32_t)runtimes::OpenXR::SwapchainIndex::UI].height ||
-            m_last_afr_state != vr->is_using_afr() ||
+            m_last_native_stereo_state != vr->is_using_native_stereo() ||
             needs_depth_resize)
         {
             m_openxr.create_swapchains();
-            m_last_afr_state = vr->is_using_afr();
+            m_last_native_stereo_state = vr->is_using_native_stereo();
         }
     }
 }
@@ -1879,7 +1879,7 @@ std::optional<std::string> D3D11Component::OpenXR::create_swapchains() {
         return std::nullopt;
     };
 
-    const auto double_wide_multiple = vr->is_using_afr() ? 1 : 2;
+    const auto double_wide_multiple = !vr->is_using_native_stereo() ? 1 : 2;
 
     XrSwapchainCreateInfo standard_swapchain_create_info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
     standard_swapchain_create_info.arraySize = 1;
@@ -1911,7 +1911,7 @@ std::optional<std::string> D3D11Component::OpenXR::create_swapchains() {
     }*/
 
     // Above is outdated, we will just use a double wide texture
-    if (!vr->is_using_afr()) {
+    if (vr->is_using_native_stereo()) {
         spdlog::info("[VR] Creating double wide swapchain for eyes");
         spdlog::info("[VR] Width: {}", vr->get_hmd_width() * 2);
         spdlog::info("[VR] Height: {}", vr->get_hmd_height());

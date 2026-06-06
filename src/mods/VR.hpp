@@ -23,12 +23,78 @@
 #undef max
 #include <tracy/Tracy.hpp>
 
+#include "PDAFWPlugin.h"
+
+#include "vr/UpscaleHelper.hpp"
+
 class VR : public Mod {
+public:
+    CameraData cameraData[2];
+    CameraDataMVCorrection cameraDataForMV[2];
+    ID3D12Resource* depthTex[2] = {NULL, NULL};
+    ID3D12Resource* uiBufferTex[2] = {NULL, NULL};
+    D3D12RendererAPI* d3d12Renderer = nullptr;
+
+    ID3D12Resource* rawMotionVectorsTex = NULL;
+
+    TextureDesc uiBufferDesc[2];
+    TextureDesc depthDesc[2];
+    TextureDesc motionVectorsDesc;
+    TextureDesc motionVectorsCorrectedDesc;
+
+    TextureDesc foveatedDepthDesc;
+    TextureDesc multipassBackupDesc[2];
+
+    TextureDesc multipassUIBufferDesc;
+
+    bool mDebug1 = false;
+    bool mDebug2 = false;
+    bool mDebug3 = false;
+    int mDebug5 = 0;
+
+    uint32_t render_size[2] = {0, 0};
+
+    NVSDK_NGX_Handle* vrDLSSHandle[2] = {NULL, NULL};
+    ffxContext vrContexts[2] = {NULL, NULL};
+
+    std::array<Matrix4x4f, 2> oldViewMatrix{};
+    std::array<Matrix4x4f, 2> oldFoveatedProjectionMatrix{};
+
+    int last_update_camera_data_frame_count = 0;
+    void update_camera_data(int frame_count);
+    void get_camera_data();
+
+    int get_vr_frame_count() { return m_frame_count; };
+    bool is_left_eye() { return m_frame_count % 2 == m_left_eye_interval; };
+
+    bool is_fix_dlss() { return m_fix_upscalers_wobbling->value(); };
+    bool is_enable_sharpening() { return m_enable_sharpening->value(); };
+    float get_sharpness() { return m_sharpness->value(); };
+
+    bool is_force_fixed_foveated() { return m_force_fixed_foveated->value(); };
+    float get_foveated_periphery_blur() { return m_foveated_periphery_blurs->value(); };
+    float get_foveated_ratio() { return m_foveated_ratio->value(); };
+    float get_foveated_offset_x() { return m_foveated_offset_x->value(); };
+    float get_foveated_offset_y() { return m_foveated_offset_y->value(); };
+
+    float get_edge_scan_line_fix_range() { return m_edge_scan_line_fix_range->value(); };
+
+    FoveatedCompositeParams get_foveated_composite_params() {
+        FoveatedCompositeParams params{};
+        params.fFadeLeft = m_foveated_fade->value();
+        params.fFadeRight = m_foveated_fade->value();
+        params.fFadeTop = m_foveated_fade->value();
+        params.fFadeBottom = m_foveated_fade->value();
+        params.fRoundedRadius = m_foveated_rounded_radius->value();
+        return params;
+    }
+
 public:
     enum RenderingMethod {
         NATIVE_STEREO = 0,
         SYNCHRONIZED = 1,
         ALTERNATING = 2,
+        ALTERNATE_FRAMEWARP = 3,
     };
 
     enum SynchronizeStage {
@@ -411,9 +477,17 @@ public:
                m_extreme_compat_mode->value() == true;
     }
 
+    bool is_using_native_stereo() const {
+        return m_rendering_method->value() == RenderingMethod::NATIVE_STEREO && m_extreme_compat_mode->value() != true;
+    }
+
     bool is_using_synchronized_afr() const {
         return m_rendering_method->value() == RenderingMethod::SYNCHRONIZED ||
                (m_extreme_compat_mode->value() && m_rendering_method->value() == RenderingMethod::NATIVE_STEREO);
+    }
+
+    bool is_using_afw() const {
+        return m_rendering_method->value() == RenderingMethod::ALTERNATE_FRAMEWARP;
     }
 
     SynchronizeStage get_synchronize_stage() {
@@ -543,7 +617,7 @@ public:
     }
 
     bool is_native_stereo_fix_enabled() const {
-        return m_native_stereo_fix->value() && !is_using_afr();
+        return m_native_stereo_fix->value() && is_using_native_stereo();
     }
 
     bool is_native_stereo_fix_same_pass_enabled() const {
@@ -837,6 +911,7 @@ private:
         "Native Stereo",
         "Synchronized Sequential",
         "Alternating/AFR",
+        "Alternate Frame Warping",
     };
 
     static const inline std::vector<std::string> s_sync_mode_names{
@@ -902,6 +977,35 @@ private:
     const ModCombo::Ptr m_vertical_projection_override{ModCombo::create(generate_name("VerticalProjectionOverride"), s_vertical_projection_override_names)};
     const ModToggle::Ptr m_grow_rectangle_for_projection_cropping{ModToggle::create(generate_name("GrowRectangleForProjectionCropping"), false)};
     const ModCombo::Ptr m_sync_mode{ ModCombo::create(generate_name("SynchronizationMode"), s_sync_mode_names, 2) };
+
+    
+    const ModToggle::Ptr m_clear_before_framewarp{ModToggle::create(generate_name("ClearBeforeFramewarp"), false)};
+    const ModToggle::Ptr m_enable_ui_fix{ModToggle::create(generate_name("EnableUIFix"), true)};
+    const ModToggle::Ptr m_enable_sharpening{ModToggle::create(generate_name("EnableSharpening"), true)};
+    const ModToggle::Ptr m_fix_upscalers_wobbling{ModToggle::create(generate_name("UpscalersWobblingFix"), true)};
+    const ModToggle::Ptr m_disable_volumetric_fog{ModToggle::create(generate_name("DisableVolumetricFog"), true)};
+    const ModToggle::Ptr m_fix_item_inspection{ModToggle::create(generate_name("FixItemInspection"), true)};
+    const ModSlider::Ptr m_sharpness{ModSlider::create(generate_name("Sharpness"), 0.0f, 1.0f, 0.6f)};
+    const ModToggle::Ptr m_framewarp_debug{ModToggle::create(generate_name("FramewarpDebug"), false)};
+    const ModSlider::Ptr m_ignore_motion_threshold{ModSlider::create(generate_name("IgnoreMotionThreshold"), 1.0f, 100.0f, 2.5f)};
+    const ModToggle::Ptr m_enable_foveated_rendering{ModToggle::create(generate_name("EnableFoveatedRendering"), false)};
+    const ModToggle::Ptr m_force_fixed_foveated{ModToggle::create(generate_name("Force Fixed Foveated"), false)};
+    const ModSlider::Ptr m_foveated_ratio{ModSlider::create(generate_name("FovatedRatio"), 0.3333333333f, 1.0f, 0.5f)};
+    const ModSlider::Ptr m_foveated_periphery_blurs{ModSlider::create(generate_name("FoveatedPeripheryBlur"), 0.0f, 5.0f, 0.0f)};
+    const ModSlider::Ptr m_foveated_fade{ModSlider::create(generate_name("FovatedFade"), 0.0f, 1.0f, 0.1f)};
+    const ModSlider::Ptr m_foveated_rounded_radius{ModSlider::create(generate_name("FovatedRoundedRadius"), 0.0f, 1.0f, 0.0f)};
+    const ModSlider::Ptr m_foveated_offset_x{ModSlider::create(generate_name("FovatedOffsetX"), -1.0f, 1.0f, 0.05f)};
+    const ModSlider::Ptr m_foveated_offset_y{ModSlider::create(generate_name("FovatedOffsetY"), -1.0f, 1.0f, -0.05f)};
+    const ModSlider::Ptr m_edge_scan_line_fix_range{ModSlider::create(generate_name("EdgeScanLineFixRange"), 0.0f, 0.5f, 0.08f)};
+    const ModCombo::Ptr m_framewarp_mode{ModCombo::create(generate_name("FramewarpMode"),
+        {
+            "None",
+            "AlternateEyeWarping",
+            "PreviousFrameWarping",
+            "CombinedWarping"
+        },
+        (int)FrameWarpMode::CombinedWarping)
+    };
 
     // Snap turn settings and globals
     void gamepad_snapturn(XINPUT_STATE& state);
@@ -1096,6 +1200,21 @@ public:
             *m_lerp_camera_roll,
             *m_lerp_camera_speed,
             *m_sync_mode,
+            *m_enable_ui_fix,
+            *m_framewarp_mode,
+            *m_enable_sharpening,
+            *m_sharpness,
+            *m_fix_upscalers_wobbling,
+            *m_disable_volumetric_fog,
+            *m_fix_item_inspection,
+            *m_enable_foveated_rendering,
+            *m_force_fixed_foveated,
+            *m_foveated_ratio,
+            *m_foveated_fade,
+            *m_foveated_rounded_radius,
+            *m_foveated_offset_x,
+            *m_foveated_offset_y,
+            *m_edge_scan_line_fix_range,
         };
 
         add_components_vr();

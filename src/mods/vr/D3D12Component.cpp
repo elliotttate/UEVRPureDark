@@ -25,14 +25,14 @@ constexpr auto ENGINE_SRC_COLOR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
 
 namespace vrmod {
 vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
-    if (m_force_reset || m_last_afr_state != vr->is_using_afr()) {
+    if (m_force_reset || m_last_native_stereo_state != vr->is_using_native_stereo()) {
         if (!setup()) {
             SPDLOG_ERROR_EVERY_N_SEC(1, "[D3D12 VR] Could not set up, trying again next frame");
             m_force_reset = true;
             return vr::VRCompositorError_None;
         }
 
-        m_last_afr_state = vr->is_using_afr();
+        m_last_native_stereo_state = vr->is_using_native_stereo();
     }
 
     auto& hook = g_framework->get_d3d12_hook();
@@ -79,8 +79,8 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     const auto is_same_frame = m_last_rendered_frame > 0 && m_last_rendered_frame == vr->m_render_frame_count;
     m_last_rendered_frame = vr->m_render_frame_count;
 
-    const auto is_actually_afr = vr->is_using_afr();
-    const auto is_afr = !is_same_frame && vr->is_using_afr();
+    const auto is_actually_afr = vr->is_using_afr() || vr->is_using_afw();
+    const auto is_afr = !is_same_frame && is_actually_afr;
     const auto is_left_eye_frame = is_afr && vr->m_render_frame_count % 2 == vr->m_left_eye_interval;
     const auto is_right_eye_frame = !is_afr || vr->m_render_frame_count % 2 == vr->m_right_eye_interval;
 
@@ -433,6 +433,241 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         }
     #endif
     }
+
+    // #############################
+    // #Frame Warp Module Start
+    // #############################
+    EyeIndex nEye = (frame_count % 2 == vr->m_left_eye_interval) ? EyeLeft : EyeRight;
+    EyeIndex nEyeOther = (frame_count % 2 == vr->m_left_eye_interval) ? EyeRight : EyeLeft;
+    auto eyeFrameBuffer = m_eyeFrameBuffers.eyeFrameBuffers[nEye];
+    auto otherEyeFrameBuffer = m_eyeFrameBuffers.eyeFrameBuffers[nEyeOther];
+    FrameWarpEvaluateParams params;
+    if ((vr->is_using_afw()) && (!m_eyeFrameBuffers.eyeFrameBuffers[0].color.pTexture || !m_eyeFrameBuffers.eyeFrameBuffers[1].color.pTexture))
+        force_reset();
+
+    auto colorDesc = eyeFrameBuffer.color.pTexture->GetDesc();
+    static TextureDesc texDesc[4];
+    int texIndex = m_backbuffer_is_8bit || true ? backbuffer_index : 3;
+    if (texDesc[texIndex].pTexture != eye_texture.Get()) {
+        texDesc[texIndex].pTexture = eye_texture.Get();
+        texDesc[texIndex].initialState = D3D12_RESOURCE_STATE_PRESENT;
+        if (texIndex == 3)
+            texDesc[texIndex].initialState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        vr->d3d12Renderer->SetupTextureDesc(texDesc[texIndex]);
+    }
+    if (texDesc[backbuffer_index].pTexture != backbuffer.Get()) {
+        texDesc[backbuffer_index].pTexture = backbuffer.Get();
+        texDesc[backbuffer_index].initialState = D3D12_RESOURCE_STATE_PRESENT;
+        vr->d3d12Renderer->SetupTextureDesc(texDesc[backbuffer_index]);
+    }
+
+    for (int i = 0; i < 2; i++) {
+        if (vr->depthDesc[i].pTexture != vr->depthTex[i]) {
+            vr->depthDesc[i].pTexture = vr->depthTex[i];
+            vr->depthDesc[i].initialState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            vr->d3d12Renderer->SetupTextureDesc(vr->depthDesc[i]);
+            vr->depthDesc[i].type = Depth;
+        }
+    }
+    if (vr->depthTex[0]) {
+        auto desc = vr->depthTex[0]->GetDesc();
+        if (vr->motionVectorsDesc.pTexture == NULL || vr->motionVectorsDesc.pTexture->GetDesc().Width != desc.Width ||
+            vr->motionVectorsDesc.pTexture->GetDesc().Height != desc.Height) {
+            vr->d3d12Renderer->CreateTexture(
+                desc.Width, desc.Height, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, vr->motionVectorsDesc, true);
+        }
+        if (vr->is_using_afw_foveated() &&
+            (vr->motionVectorsCorrectedDesc.pTexture == NULL || vr->motionVectorsCorrectedDesc.pTexture->GetDesc().Width != desc.Width ||
+                vr->motionVectorsCorrectedDesc.pTexture->GetDesc().Height != desc.Height)) {
+            vr->d3d12Renderer->CreateTexture(desc.Width, desc.Height, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
+                vr->motionVectorsCorrectedDesc, true);
+        }
+        if (vr->is_using_afw_foveated() &&
+            (vr->foveatedDepthDesc.pTexture == NULL || vr->foveatedDepthDesc.pTexture->GetDesc().Width != desc.Width ||
+                vr->foveatedDepthDesc.pTexture->GetDesc().Height != desc.Height)) {
+            vr->d3d12Renderer->CreateTexture(
+                desc.Width, desc.Height, desc.Format, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, vr->foveatedDepthDesc, false);
+        }
+    }
+
+    auto cmdList = vr->d3d12Renderer->BeginCommandList(backbuffer_index);
+
+    if ((vr->is_using_any_afw()) && m_eyeFrameBuffers.eyeFrameBuffers[0].color.pTexture && vr->depthTex[0]) {
+        static FrameBufferDesc s_CurrentEyeFrameBuffer{};
+
+        s_CurrentEyeFrameBuffer.color = texDesc[texIndex];
+        s_CurrentEyeFrameBuffer.depth = vr->depthDesc[0];
+        s_CurrentEyeFrameBuffer.motionVectors = vr->motionVectorsDesc;
+
+        if (!vr->get_runtime()->hiddenAreaMeshVextexBuffer[0].pVextexBuffer && vr->get_runtime()->hiddenAreaMesh[0].pVertexData) {
+            UINT vertexSize = sizeof(vr::HmdVector2_t);
+            vr->d3d12Renderer->CreateVertexBuffer(cmdList, vr->get_runtime()->hiddenAreaMeshVextexBuffer[0],
+                vr->get_runtime()->hiddenAreaMesh[0].unTriangleCount * 3, vertexSize,
+                (float*)vr->get_runtime()->hiddenAreaMesh[0].pVertexData);
+            vr->d3d12Renderer->CreateVertexBuffer(cmdList, vr->get_runtime()->hiddenAreaMeshVextexBuffer[1],
+                vr->get_runtime()->hiddenAreaMesh[1].unTriangleCount * 3, vertexSize,
+                (float*)vr->get_runtime()->hiddenAreaMesh[1].pVertexData);
+        }
+
+        params.InCmdList = cmdList;
+        params.InEyeFrameBuffer = &s_CurrentEyeFrameBuffer;
+        params.InUIColorAlpha = NULL;
+        params.IsHudlessColor = true;
+        params.MotionVectorsType = vr->is_fix_dlss() ? Normal : FromOtherEye;
+        params.InMotionScale[0] = (float)colorDesc.Width;
+        params.InMotionScale[1] = (float)colorDesc.Height;
+        params.Mode = (FrameWarpMode)vr->m_framewarp_mode->value();
+        params.EyeIndex = nEye;
+        params.ClearBeforeWarping = vr->m_clear_before_framewarp->value();
+        params.CameraData = &vr->cameraData[nEye];
+        params.IgnoreMotionThreshold = vr->m_ignore_motion_threshold->value();
+        params.Debug = vr->m_framewarp_debug->value();
+
+        if (!vr->is_foveated_rendering()) {
+            if (vr->m_enable_ui_fix->value() && vr->uiBufferDesc[0].pTexture) {
+                params.InUIColorAlpha = &vr->uiBufferDesc[0];
+                params.IsHudlessColor = false;
+            }
+            // Sharpening
+            if (vr->is_enable_sharpening() && vr->get_sharpness() > 0) {
+                vr->d3d12Renderer->Sharpen(cmdList, eyeFrameBuffer.color, s_CurrentEyeFrameBuffer.color, vr->get_sharpness());
+                s_CurrentEyeFrameBuffer.color = eyeFrameBuffer.color;
+            }
+            EvaluateFrameWarp(params);
+        } else if (vr->is_using_afw_foveated()) {
+            auto foveatedVP = vr->get_runtime()->foveated_viewports[nEye];
+            D3D12_VIEWPORT vp;
+            vp.TopLeftX = foveatedVP.TopLeftX * colorDesc.Width;
+            vp.TopLeftY = foveatedVP.TopLeftY * colorDesc.Height;
+            vp.Width = foveatedVP.Width * colorDesc.Width;
+            vp.Height = foveatedVP.Height * colorDesc.Height;
+            vp.MinDepth = 0;
+            vp.MaxDepth = 1;
+            FLOAT black[4] = {0, 0, 0, 0};
+            if (vr->multipassBackupDesc[nEye].pTexture) {
+                float edgeCutoutRatio = vr->get_edge_scan_line_fix_range();
+                float blurRadius = vr->get_foveated_periphery_blur();
+                edgeCutoutRatio = 1.0f - 1.0f / (1.0f + edgeCutoutRatio);
+                auto desc = s_CurrentEyeFrameBuffer.color.pTexture->GetDesc();
+                D3D12_BOX srcBox = (nEye == EyeRight) ? CD3DX12_BOX(edgeCutoutRatio * desc.Width, 0, desc.Width, desc.Height)
+                                                      : CD3DX12_BOX(0, 0, (1 - edgeCutoutRatio) * desc.Width, desc.Height);
+                if (vr->mDebug1 || (edgeCutoutRatio <= 0 && blurRadius <= 0)) {
+                    vr->d3d12Renderer->Blit(cmdList, eyeFrameBuffer.color, s_CurrentEyeFrameBuffer.color);
+                    vr->d3d12Renderer->Blit(cmdList, eyeFrameBuffer.depth, vr->depthDesc[1]);
+                } else if (edgeCutoutRatio > 0 && blurRadius <= 0) {
+                    vr->d3d12Renderer->Crop(cmdList, eyeFrameBuffer.color, s_CurrentEyeFrameBuffer.color, srcBox);
+                    vr->d3d12Renderer->Crop(cmdList, eyeFrameBuffer.depth, vr->depthDesc[1], srcBox);
+                } else if (edgeCutoutRatio > 0 && blurRadius > 0) {
+                    vr->d3d12Renderer->Crop(cmdList, otherEyeFrameBuffer.color, s_CurrentEyeFrameBuffer.color, srcBox);
+                    vr->d3d12Renderer->Blur(cmdList, eyeFrameBuffer.color, otherEyeFrameBuffer.color, blurRadius);
+                    vr->d3d12Renderer->Crop(cmdList, eyeFrameBuffer.depth, vr->depthDesc[1], srcBox);
+                } else {
+                    vr->d3d12Renderer->Blur(cmdList, eyeFrameBuffer.color, s_CurrentEyeFrameBuffer.color, blurRadius);
+                    vr->d3d12Renderer->Blit(cmdList, eyeFrameBuffer.depth, vr->depthDesc[1]);
+                }
+                vr->d3d12Renderer->Blit(cmdList, eyeFrameBuffer.depth, vr->foveatedDepthDesc, vp);
+
+                if (vr->m_enable_ui_fix->value() && vr->multipassUIBufferDesc.pTexture) {
+                    if (edgeCutoutRatio > 0) {
+                        vr->d3d12Renderer->Crop(cmdList, vr->multipassUIBufferDesc, vr->uiBufferDesc[1], srcBox);
+                    } else {
+                        vr->d3d12Renderer->Blit(cmdList, vr->multipassUIBufferDesc, vr->uiBufferDesc[1]);
+                    }
+                    params.InUIColorAlpha = &vr->multipassUIBufferDesc;
+                    params.IsHudlessColor = false;
+                }
+                TonemapParams params;
+                params.fGamma = 1.10f;
+                params.fLowerLimit = 0.024f;
+                params.fUpperLimit = 0.982f;
+                params.fConvertToLimit = 0.958f;
+                vr->d3d12Renderer->Tonemap(cmdList, vr->multipassBackupDesc[nEye], vr->uiBufferDesc[0], params);
+                vr->d3d12Renderer->FoveatedComposite(
+                    cmdList, eyeFrameBuffer.color, vr->multipassBackupDesc[nEye], vp, vr->get_foveated_composite_params());
+            } else {
+                vr->d3d12Renderer->Blit(cmdList, eyeFrameBuffer.color, s_CurrentEyeFrameBuffer.color);
+                if (vr->m_enable_ui_fix->value() && vr->multipassUIBufferDesc.pTexture) {
+                    vr->d3d12Renderer->Blit(cmdList, vr->multipassUIBufferDesc, vr->uiBufferDesc[1]);
+                    params.InUIColorAlpha = &vr->multipassUIBufferDesc;
+                    params.IsHudlessColor = false;
+                }
+            }
+
+            vr->d3d12Renderer->Clear(cmdList, eyeFrameBuffer.motionVectors, black);
+            if (vr->motionVectorsDesc.pTexture && vr->motionVectorsCorrectedDesc.pTexture) {
+                CorrectMotionVectorsParams mvparams;
+                mvparams.inMotionVectors = &vr->motionVectorsDesc;
+                mvparams.inDepth = &vr->foveatedDepthDesc;
+                mvparams.cameraData = &vr->cameraDataForMV[nEye];
+                mvparams.InMotionScale[0] = (float)vr->motionVectorsDesc.pTexture->GetDesc().Width;
+                mvparams.InMotionScale[1] = (float)vr->motionVectorsDesc.pTexture->GetDesc().Height;
+                mvparams.extractObjectOnlyMotion = true;
+                vr->d3d12Renderer->CorrectMotionVectors(cmdList, vr->motionVectorsCorrectedDesc, mvparams);
+                vr->d3d12Renderer->Blit(cmdList, eyeFrameBuffer.motionVectors, vr->motionVectorsCorrectedDesc, vp);
+            }
+
+            // Sharpening
+            if (vr->is_enable_sharpening() && vr->get_sharpness() > 0) {
+                vr->d3d12Renderer->Sharpen(cmdList, otherEyeFrameBuffer.color, eyeFrameBuffer.color, vr->get_sharpness());
+                vr->d3d12Renderer->Copy(cmdList, eyeFrameBuffer.color, otherEyeFrameBuffer.color);
+            }
+            if (vr->m_desktop_fix->value()) {
+                vr->d3d12Renderer->Blit(cmdList, texDesc[texIndex], eyeFrameBuffer.color);
+            }
+            s_CurrentEyeFrameBuffer.color = eyeFrameBuffer.color;
+            s_CurrentEyeFrameBuffer.depth = eyeFrameBuffer.depth;
+            s_CurrentEyeFrameBuffer.motionVectors = eyeFrameBuffer.motionVectors;
+            params.InEyeFrameBuffer = &s_CurrentEyeFrameBuffer;
+            params.MotionVectorsType = ObjectOnly;
+            params.isFoveated = true;
+            auto foveatedVPOther = vr->get_runtime()->foveated_viewports[nEyeOther];
+            D3D12_VIEWPORT vpOther;
+            vpOther.TopLeftX = foveatedVPOther.TopLeftX * colorDesc.Width;
+            vpOther.TopLeftY = foveatedVPOther.TopLeftY * colorDesc.Height;
+            vpOther.Width = foveatedVPOther.Width * colorDesc.Width;
+            vpOther.Height = foveatedVPOther.Height * colorDesc.Height;
+            params.foveatedArea =
+                RECT(vpOther.TopLeftX, vpOther.TopLeftY, vpOther.TopLeftX + vpOther.Width, vpOther.TopLeftY + vpOther.Height);
+            EvaluateFrameWarp(params);
+        }
+
+        for (int i = 0; i < 2; i++) {
+            if (vr->uiBufferDesc[i].pTexture) {
+                D3D12_RESOURCE_BARRIER barriers1[] = {CD3DX12_RESOURCE_BARRIER::Transition(
+                    vr->uiBufferDesc[i].pTexture, vr->uiBufferDesc[i].initialState, D3D12_RESOURCE_STATE_RENDER_TARGET)};
+                FLOAT black[4] = {0, 0, 0, 0};
+                cmdList->ResourceBarrier(_countof(barriers1), barriers1);
+
+                cmdList->ClearRenderTargetView(vr->uiBufferDesc[i].renderTargetViewHandle, black, 0, NULL);
+
+                D3D12_RESOURCE_BARRIER barriers2[] = {CD3DX12_RESOURCE_BARRIER::Transition(
+                    vr->uiBufferDesc[i].pTexture, D3D12_RESOURCE_STATE_RENDER_TARGET, vr->uiBufferDesc[i].initialState)};
+                cmdList->ResourceBarrier(_countof(barriers2), barriers2);
+            }
+        }
+    } else {
+        vr->d3d12Renderer->Blit(cmdList, eyeFrameBuffer.color, texDesc[texIndex]);
+        for (int i = 0; i < 2; i++) {
+            if (vr->uiBufferDesc[i].pTexture) {
+                D3D12_RESOURCE_BARRIER barriers1[] = {CD3DX12_RESOURCE_BARRIER::Transition(
+                    vr->uiBufferDesc[i].pTexture, vr->uiBufferDesc[i].initialState, D3D12_RESOURCE_STATE_RENDER_TARGET)};
+                FLOAT black[4] = {0, 0, 0, 0};
+                cmdList->ResourceBarrier(_countof(barriers1), barriers1);
+
+                cmdList->ClearRenderTargetView(vr->uiBufferDesc[i].renderTargetViewHandle, black, 0, NULL);
+
+                D3D12_RESOURCE_BARRIER barriers2[] = {CD3DX12_RESOURCE_BARRIER::Transition(
+                    vr->uiBufferDesc[i].pTexture, D3D12_RESOURCE_STATE_RENDER_TARGET, vr->uiBufferDesc[i].initialState)};
+                cmdList->ResourceBarrier(_countof(barriers2), barriers2);
+            }
+        }
+    }
+
+    vr->d3d12Renderer->EndCommandList(backbuffer_index);
+
+    // #############################
+    // #Frame Warp Module End
+    // #############################
 
     // If m_frame_count is even, we're rendering the left eye.
     if (is_left_eye_frame) {
@@ -1094,11 +1329,11 @@ void D3D12Component::on_reset(VR* vr) {
             vr->m_openxr->swapchains.empty() ||
             g_framework->get_d3d12_rt_size()[0] != vr->m_openxr->swapchains[(uint32_t)runtimes::OpenXR::SwapchainIndex::UI].width ||
             g_framework->get_d3d12_rt_size()[1] != vr->m_openxr->swapchains[(uint32_t)runtimes::OpenXR::SwapchainIndex::UI].height ||
-            m_last_afr_state != vr->is_using_afr() ||
+            m_last_native_stereo_state != vr->is_using_native_stereo() ||
             needs_depth_resize)
         {
             m_openxr.create_swapchains();
-            m_last_afr_state = vr->is_using_afr();
+            m_last_native_stereo_state = vr->is_using_native_stereo();
         }
 
         // end the frame before something terrible happens
@@ -1197,12 +1432,31 @@ bool D3D12Component::setup() {
         }
     }
 
+    // #############################
+    // #Frame Warp Module Start
+    // #############################
+    static uint32_t lastSize[2]{0, 0};
+    static DXGI_FORMAT lastFormat = DXGI_FORMAT_UNKNOWN;
+    if ((lastSize[0] != vr->get_hmd_width() || lastSize[1] != vr->get_hmd_height() || lastFormat != backbuffer_desc.Format)) {
+        FrameWarpInitParams params = {vr->get_hmd_width(), vr->get_hmd_height(), backbuffer_desc.Format};
+        m_eyeFrameBuffers = InitFrameWarp(params);
+        lastSize[0] = vr->get_hmd_width();
+        lastSize[1] = vr->get_hmd_height();
+    }
+    // #############################
+    // #Frame Warp Module End
+    // #############################
+
     if (vr->get_runtime()->is_openvr()) {
         for (auto& ctx : m_openvr.left_eye_tex) {
-            if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &backbuffer_desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
-                    IID_PPV_ARGS(&ctx.texture)))) {
-                spdlog::error("[VR] Failed to create left eye texture.");
-                return false;
+            if (m_eyeFrameBuffers.eyeFrameBuffers[0].color.pTexture != NULL) {
+                ctx.texture = m_eyeFrameBuffers.eyeFrameBuffers[0].color.pTexture;
+            } else {
+                if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &backbuffer_desc,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&ctx.texture)))) {
+                    spdlog::error("[VR] Failed to create left eye texture.");
+                    return false;
+                }
             }
 
             ctx.texture->SetName(L"OpenVR Left Eye Texture");
@@ -1213,10 +1467,14 @@ bool D3D12Component::setup() {
         }
 
         for (auto& ctx : m_openvr.right_eye_tex) {
-            if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &backbuffer_desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
-                    IID_PPV_ARGS(&ctx.texture)))) {
-                spdlog::error("[VR] Failed to create right eye texture.");
-                return false;
+            if (m_eyeFrameBuffers.eyeFrameBuffers[1].color.pTexture != NULL) {
+                ctx.texture = m_eyeFrameBuffers.eyeFrameBuffers[1].color.pTexture;
+            } else {
+                if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &backbuffer_desc,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&ctx.texture)))) {
+                    spdlog::error("[VR] Failed to create right eye texture.");
+                    return false;
+                }
             }
 
             ctx.texture->SetName(L"OpenVR Right Eye Texture");
@@ -1447,7 +1705,7 @@ std::optional<std::string> D3D12Component::OpenXR::create_swapchains() {
         return std::nullopt;
     };
 
-    const auto double_wide_multiple = vr->is_using_afr() ? 1 : 2;
+    const auto double_wide_multiple = !vr->is_using_native_stereo() ? 1 : 2;
 
     XrSwapchainCreateInfo standard_swapchain_create_info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
     standard_swapchain_create_info.arraySize = 1;
@@ -1468,7 +1726,7 @@ std::optional<std::string> D3D12Component::OpenXR::create_swapchains() {
     hmd_desc.Flags &= ~D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
 
     // Above is outdated, we will just use a double wide texture
-    if (!vr->is_using_afr()) {
+    if (vr->is_using_native_stereo()) {
         spdlog::info("[VR] Creating double wide swapchain for eyes");
         spdlog::info("[VR] Width: {}", vr->get_hmd_width() * 2);
         spdlog::info("[VR] Height: {}", vr->get_hmd_height());
@@ -1589,7 +1847,7 @@ std::optional<std::string> D3D12Component::OpenXR::create_swapchains() {
             depth_desc.Height = vr->get_hmd_height();
         }
 
-        if (!vr->is_using_afr()) {
+        if (vr->is_using_native_stereo()) {
             spdlog::info("[VR] Creating double wide depth swapchain");
             if (auto err = create_swapchain((uint32_t)runtimes::OpenXR::SwapchainIndex::DEPTH, depth_swapchain_create_info, depth_desc)) {
                 return err;

@@ -1712,8 +1712,9 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
     }
 
     const auto is_afr = VR::get()->is_using_afr();
+    const auto is_afw = VR::get()->is_using_afw();
 
-    if (is_afr) {
+    if (is_afr || is_afw) {
         if (!this->swapchains.contains((uint32_t)OpenXR::SwapchainIndex::AFR_LEFT_EYE) || !this->swapchains.contains((uint32_t)OpenXR::SwapchainIndex::AFR_RIGHT_EYE)) {
             spdlog::error("[VR] AFR swapchains not created");
             return XR_ERROR_VALIDATION_FAILURE;

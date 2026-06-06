@@ -296,6 +296,39 @@ set_target_properties(openvr PROPERTIES
 unset(CMKR_TARGET)
 unset(CMKR_SOURCES)
 
+# Target pdafwmod
+set(CMKR_TARGET pdafwmod)
+set(pdafwmod_SOURCES "")
+
+list(APPEND pdafwmod_SOURCES
+	"dependencies/pd-afwmod/dummy/PDAFWPlugin.cpp"
+)
+
+list(APPEND pdafwmod_SOURCES
+	cmake.toml
+)
+
+set(CMKR_SOURCES ${pdafwmod_SOURCES})
+add_library(pdafwmod SHARED)
+
+if(pdafwmod_SOURCES)
+	target_sources(pdafwmod PRIVATE ${pdafwmod_SOURCES})
+endif()
+
+source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${pdafwmod_SOURCES})
+
+target_include_directories(pdafwmod PUBLIC
+	"dependencies/pd-afwmod/include"
+)
+
+set_target_properties(pdafwmod PROPERTIES
+	OUTPUT_NAME
+		PDAFWPlugin
+)
+
+unset(CMKR_TARGET)
+unset(CMKR_SOURCES)
+
 # Target imgui
 set(CMKR_TARGET imgui)
 set(imgui_SOURCES "")
@@ -796,6 +829,7 @@ list(APPEND uevr_SOURCES
 	"src/mods/vr/IXRTrackingSystemHook.hpp"
 	"src/mods/vr/OverlayComponent.hpp"
 	"src/mods/vr/RenderTargetPoolHook.hpp"
+	"src/mods/vr/UpscaleHelper.hpp"
 	"src/mods/vr/d3d12/ComPtr.hpp"
 	"src/mods/vr/d3d12/CommandContext.hpp"
 	"src/mods/vr/d3d12/DirectXTK.hpp"
@@ -861,6 +895,7 @@ target_link_libraries(uevr PUBLIC
 	sdkgenny
 	asmjit
 	luavrlib
+	pdafwmod
 )
 
 target_link_libraries(uevr PUBLIC
@@ -872,7 +907,7 @@ set_target_properties(uevr PROPERTIES
 	OUTPUT_NAME
 		UEVRBackend
 	LINK_FLAGS
-		"/DELAYLOAD:openvr_api.dll"
+		"/DELAYLOAD:openvr_api.dll /DELAYLOAD:PDAFWPlugin.dll"
 	RUNTIME_OUTPUT_DIRECTORY_RELEASE
 		"${CMAKE_BINARY_DIR}/bin/${CMKR_TARGET}"
 	RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO

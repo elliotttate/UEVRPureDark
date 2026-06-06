@@ -124,6 +124,14 @@ alias = "openvr_api"
 [target.openvr.properties]
 OUTPUT_NAME = "openvr_api"
 
+[target.pdafwmod]
+type = "shared"
+include-directories = ["dependencies/pd-afwmod/include"]
+sources = ["dependencies/pd-afwmod/dummy/**.cpp"]
+
+[target.pdafwmod.properties]
+OUTPUT_NAME = "PDAFWPlugin"
+
 [target.imgui]
 type = "static"
 sources = ["dependencies/submodules/imgui/*.cpp"]
@@ -256,12 +264,13 @@ link-libraries = [
     "DirectXTK12",
     "sdkgenny",
     "asmjit",
-    "luavrlib"
+    "luavrlib",
+    "pdafwmod"
 ]
 
 [template.ue4template.properties]
 OUTPUT_NAME = "UEVRBackend"
-LINK_FLAGS = "/DELAYLOAD:openvr_api.dll"
+LINK_FLAGS = "/DELAYLOAD:openvr_api.dll /DELAYLOAD:PDAFWPlugin.dll"
 RUNTIME_OUTPUT_DIRECTORY_RELEASE = "${CMAKE_BINARY_DIR}/bin/${CMKR_TARGET}"
 RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO = "${CMAKE_BINARY_DIR}/bin/${CMKR_TARGET}"
 LIBRARY_OUTPUT_DIRECTORY_RELEASE = "${CMAKE_BINARY_DIR}/lib/${CMKR_TARGET}"

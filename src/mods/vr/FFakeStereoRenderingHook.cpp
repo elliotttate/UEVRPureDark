@@ -2947,7 +2947,7 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
         int32_t x = 0;
         int32_t y = 0;
 
-        if (!vr->is_using_afr() && true_index == 1 && !vr->is_native_stereo_fix_enabled()) {
+        if (vr->is_using_native_stereo() && true_index == 1 && !vr->is_native_stereo_fix_enabled()) {
             x += w;
         }
 
