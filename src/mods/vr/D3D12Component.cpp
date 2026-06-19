@@ -72,6 +72,40 @@ void copy_provider_resource(VR* vr, ID3D12GraphicsCommandList* cmd_list, Texture
     vr->d3d12Renderer->SetupTextureDesc(src);
     vr->d3d12Renderer->Copy(cmd_list, dest, src);
 }
+
+bool provider_view_shape_changed(UEVR_FrameResourceView& previous, const UEVR_FrameResourceView& current) {
+    const bool changed = previous.width != current.width ||
+        previous.height != current.height ||
+        previous.format != current.format ||
+        previous.provider != current.provider ||
+        previous.motion_scale_x != current.motion_scale_x ||
+        previous.motion_scale_y != current.motion_scale_y;
+
+    if (changed) {
+        previous = current;
+    }
+
+    return changed;
+}
+
+void log_provider_copy(bool velocity, const UEVR_FrameResourceView& view) {
+    static UEVR_FrameResourceView s_last_depth_copy{};
+    static UEVR_FrameResourceView s_last_velocity_copy{};
+    auto& previous = velocity ? s_last_velocity_copy : s_last_depth_copy;
+
+    if (!provider_view_shape_changed(previous, view)) {
+        return;
+    }
+
+    if (velocity) {
+        SPDLOG_INFO("[AFWFrameResources] AFW copied provider velocity {}x{} fmt={} provider={} scale=({}, {}) frame={}",
+                    view.width, view.height, view.format, view.provider,
+                    view.motion_scale_x, view.motion_scale_y, view.render_frame);
+    } else {
+        SPDLOG_INFO("[AFWFrameResources] AFW copied provider depth {}x{} fmt={} provider={} frame={}",
+                    view.width, view.height, view.format, view.provider, view.render_frame);
+    }
+}
 }
 
 namespace vrmod {
@@ -502,6 +536,11 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     bool using_provider_depth = false;
     bool using_provider_velocity = false;
 
+    if (uevr_afw_bridge::enabled() && !uevr_afw_bridge::available()) {
+        SPDLOG_WARN_ONCE("[AFWFrameResources] bridge enabled but provider API unavailable: {}",
+                         uevr_afw_bridge::describe_state());
+    }
+
     if (!vr->rawDepthTex && provider_depth_valid) {
         vr->rawDepthTex = provider_depth.texture;
         using_provider_depth = true;
@@ -578,9 +617,11 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
         if (using_provider_depth) {
             copy_provider_resource(vr, cmdList, vr->depthDesc[nEye], provider_depth.texture);
+            log_provider_copy(false, provider_depth.view);
         }
         if (using_provider_velocity) {
             copy_provider_resource(vr, cmdList, vr->motionVectorsDesc[nEye], provider_velocity.texture);
+            log_provider_copy(true, provider_velocity.view);
         }
 
         s_CurrentEyeFrameBuffer.color = eyeFrameBuffer.color;
