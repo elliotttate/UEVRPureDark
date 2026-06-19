@@ -21,6 +21,7 @@
 #include "d3d12/CommandContext.hpp"
 #include "d3d12/TextureContext.hpp"
 
+#include "AFWFrameResourcesBridge.hpp"
 #include "PDAFWPlugin.h"
 
 class VR;
@@ -52,6 +53,29 @@ public:
 
 private:
     bool setup();
+    bool setup_velocity_combine_pipeline(ID3D12Device* device);
+    bool combine_ue_velocity_for_afw(
+        VR* vr,
+        ID3D12GraphicsCommandList* command_list,
+        const UEVR_FrameResourceView& velocity_view,
+        TextureDesc& depth_desc,
+        TextureDesc& output_desc,
+        EyeIndex eye,
+        bool force_reconstruct);
+    bool prepare_frame_resource_combined_motion_vectors(
+        VR* vr,
+        ID3D12GraphicsCommandList* command_list,
+        EyeIndex eye,
+        TextureDesc& output_dst,
+        bool force_reconstruct);
+
+    bool setup_debug_view_pipeline(ID3D12Device* device);
+    bool render_frame_resource_debug_view(VR* vr, ID3D12GraphicsCommandList* command_list, int view_mode,
+                                          TextureDesc& backbuffer_dst, TextureDesc* other_eye_dst);
+    // Cycle-able buffer visualizer (motion vectors / depth / raw velocity) blitted into the eyes.
+    void render_debug_view(VR* vr, ID3D12GraphicsCommandList* command_list, int view_mode, EyeIndex eye,
+                           TextureDesc& backbuffer_dst, TextureDesc* other_eye_dst);
+
     std::unique_ptr<DirectX::DX12::SpriteBatch> setup_sprite_batch_pso(
         DXGI_FORMAT output_format, 
         std::span<const uint8_t> vs = {}, std::span<const uint8_t> ps = {},
@@ -79,6 +103,17 @@ private:
     std::unique_ptr<DirectX::DX12::SpriteBatch> m_backbuffer_batch{};
     std::unique_ptr<DirectX::DX12::SpriteBatch> m_game_batch{};
     std::unique_ptr<DirectX::DX12::SpriteBatch> m_ui_batch_alpha_invert{};
+    ComPtr<ID3D12RootSignature> m_velocity_combine_root_signature{};
+    ComPtr<ID3D12PipelineState> m_velocity_combine_pso{};
+    std::array<TextureDesc, 2> m_raw_velocity_desc{};
+    // Stable inline copy of the bridged (often transient/aliased) raw velocity, captured on the
+    // combine's command list so a deferred readback sees exactly what the combine decoded.
+    TextureDesc m_raw_velocity_stable{};
+
+    ComPtr<ID3D12RootSignature> m_debug_view_root_signature{};
+    ComPtr<ID3D12PipelineState> m_debug_view_pso{};
+    std::array<TextureDesc, 2> m_combined_debug_velocity_desc{};
+    TextureDesc m_debug_view_tex{};
 
     ID3D12Resource* m_last_checked_native{nullptr};
 

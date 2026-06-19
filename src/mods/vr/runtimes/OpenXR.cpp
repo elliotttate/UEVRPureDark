@@ -1,6 +1,8 @@
 #include <Windows.h>
 #include <TlHelp32.h>
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 
@@ -21,6 +23,38 @@
 using namespace nlohmann;
 
 namespace runtimes {
+namespace {
+bool afw_env_bool(const char* name, bool default_value) {
+    char value[16]{};
+    const auto len = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+
+    if (len == 0) {
+        return default_value;
+    }
+
+    std::string_view v{value, std::min<size_t>(len, sizeof(value) - 1)};
+    return v != "0" && v != "false" && v != "FALSE" && v != "off" && v != "OFF";
+}
+
+float afw_env_float(const char* name, float default_value) {
+    char value[32]{};
+    const auto len = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+
+    if (len == 0) {
+        return default_value;
+    }
+
+    char* end{};
+    const auto parsed = std::strtof(value, &end);
+
+    if (end == value) {
+        return default_value;
+    }
+
+    return parsed;
+}
+}
+
 void OpenXR::on_draw_ui() {
     ImGui::SetNextItemOpen(true, ImGuiCond_Once);
     if (ImGui::TreeNode("OpenXR Options")) {
@@ -482,6 +516,8 @@ VRRuntime::Error OpenXR::update_matrices(float nearz, float farz) {
     this->eyes[1] = Matrix4x4f{OpenXR::to_glm(right_pose.orientation)};
     this->eyes[1][3] = Vector4f{*(Vector3f*)&right_pose.position, 1.0f};
 
+    std::array<std::array<float, 4>, 2> derived_tan_half_fov{};
+
     auto get_mat = [&](int eye) {
         const auto& vr = VR::get();
         std::array<float, 4> tan_half_fov{};
@@ -513,6 +549,26 @@ VRRuntime::Error OpenXR::update_matrices(float nearz, float farz) {
             tan_half_fov[2] = this->raw_projections[eye][2];
             tan_half_fov[3] = this->raw_projections[eye][3];
         }
+
+        const bool projection_override_active =
+            vr->get_horizontal_projection_override() != VR::HORIZONTAL_PROJECTION_OVERRIDE::HORIZONTAL_DEFAULT ||
+            vr->get_vertical_projection_override() != VR::VERTICAL_PROJECTION_OVERRIDE::VERTICAL_DEFAULT;
+        const float afw_guard_band_scale =
+            std::max(1.0f, afw_env_float("UEVR_AFW_GUARD_BAND_SCALE", 1.0f));
+
+        if (vr->is_using_afw() &&
+            projection_override_active &&
+            afw_env_bool("UEVR_AFW_EXTRA_GUARD_BAND", false) &&
+            afw_guard_band_scale > 1.0f) {
+            for (auto& value : tan_half_fov) {
+                value *= afw_guard_band_scale;
+            }
+
+            if (eye == 1) {
+                SPDLOG_INFO("AFW extra projection guard band scale: {}", afw_guard_band_scale);
+            }
+        }
+
         view_bounds[eye][0] = 0.5f - 0.5f * this->raw_projections[eye][0] / tan_half_fov[0];
         view_bounds[eye][1] = 0.5f + 0.5f * this->raw_projections[eye][1] / tan_half_fov[1];
         view_bounds[eye][2] = 0.5f - 0.5f * this->raw_projections[eye][2] / tan_half_fov[2];
@@ -534,6 +590,7 @@ VRRuntime::Error OpenXR::update_matrices(float nearz, float farz) {
         const auto right =  tan_half_fov[1];
         const auto top =    tan_half_fov[2];
         const auto bottom = tan_half_fov[3];
+        derived_tan_half_fov[eye] = tan_half_fov;
 
         // signs: at this point we expect left[0] and bottom[3] to be negative
         SPDLOG_INFO("Original FOV for {} eye: {}, {}, {}, {}", eye == 0 ? "left" : "right", this->raw_projections[eye][0], this->raw_projections[eye][1],
@@ -570,11 +627,36 @@ VRRuntime::Error OpenXR::update_matrices(float nearz, float farz) {
         this->raw_projections[1][3] = tan(right_fov.angleDown);
         this->projections[0] = get_mat(0);
         this->projections[1] = get_mat(1);
-        auto world_to_meters = VR::get()->get_world_to_meters();
-        XrMatrix4x4f_CreateProjection((XrMatrix4x4f*)&this->afw_projections[0], GRAPHICS_D3D, raw_projections[0][0], raw_projections[0][1],
-            raw_projections[0][2], raw_projections[0][3], nearz / world_to_meters, -1.0f);
-        XrMatrix4x4f_CreateProjection((XrMatrix4x4f*)&this->afw_projections[1], GRAPHICS_D3D, raw_projections[1][0], raw_projections[1][1],
-            raw_projections[1][2], raw_projections[1][3], nearz / world_to_meters, -1.0f);
+        const auto& vr = VR::get();
+        auto world_to_meters = vr->get_world_to_meters();
+        if (world_to_meters <= 0.0f) {
+            world_to_meters = 1.0f;
+        }
+
+        const bool projection_override_active =
+            vr->get_horizontal_projection_override() != VR::HORIZONTAL_PROJECTION_OVERRIDE::HORIZONTAL_DEFAULT ||
+            vr->get_vertical_projection_override() != VR::VERTICAL_PROJECTION_OVERRIDE::VERTICAL_DEFAULT;
+        const bool use_derived_afw_projection =
+            projection_override_active && afw_env_bool("UEVR_AFW_DERIVED_PROJECTIONS", true);
+
+        const std::array<float, 4> raw_left_fov{
+            raw_projections[0][0], raw_projections[0][1], raw_projections[0][2], raw_projections[0][3]};
+        const std::array<float, 4> raw_right_fov{
+            raw_projections[1][0], raw_projections[1][1], raw_projections[1][2], raw_projections[1][3]};
+        const auto afw_left_fov = use_derived_afw_projection ? derived_tan_half_fov[0] : raw_left_fov;
+        const auto afw_right_fov = use_derived_afw_projection ? derived_tan_half_fov[1] : raw_right_fov;
+
+        XrMatrix4x4f_CreateProjection((XrMatrix4x4f*)&this->afw_projections[0], GRAPHICS_D3D, afw_left_fov[0], afw_left_fov[1],
+            afw_left_fov[2], afw_left_fov[3], nearz / world_to_meters, -1.0f);
+        XrMatrix4x4f_CreateProjection((XrMatrix4x4f*)&this->afw_projections[1], GRAPHICS_D3D, afw_right_fov[0], afw_right_fov[1],
+            afw_right_fov[2], afw_right_fov[3], nearz / world_to_meters, -1.0f);
+
+        if (use_derived_afw_projection) {
+            SPDLOG_INFO("AFW using derived projection FOVs: left {}, {}, {}, {}; right {}, {}, {}, {}; grow={}",
+                afw_left_fov[0], afw_left_fov[1], afw_left_fov[2], afw_left_fov[3],
+                afw_right_fov[0], afw_right_fov[1], afw_right_fov[2], afw_right_fov[3],
+                vr->should_grow_rectangle_for_projection_cropping());
+        }
         this->should_recalculate_eye_projections = false;
         this->last_eye_matrix_nearz = nearz;
     }

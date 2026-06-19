@@ -520,6 +520,15 @@ void FFakeStereoRenderingHook::attempt_hook_slate_thread(uintptr_t return_addres
 
     auto func = alternate ? sdk::slate::locate_draw_window_renderthread_fn_alternate() : sdk::slate::locate_draw_window_renderthread_fn();
 
+    if (!func && !alternate) {
+        func = sdk::slate::locate_draw_window_renderthread_fn_alternate();
+
+        if (func) {
+            SPDLOG_INFO("Using alternate SlateRHIRenderer::DrawWindow_RenderThread scan result after primary scan failed");
+            m_attempted_hook_slate_thread_alternate = true;
+        }
+    }
+
     if (!func && return_address == 0) {
         SPDLOG_ERROR("Cannot hook FSlateRHIRenderer::DrawWindow_RenderThread");
         return;
@@ -6022,19 +6031,13 @@ void* FFakeStereoRenderingHook::slate_draw_window_render_thread(void* renderer, 
         return call_orig();
     }
 
-    const auto ui_target = g_hook->get_render_target_manager()->get_ui_target();
-
-    if (ui_target == nullptr) {
-        SPDLOG_INFO_EVERY_N_SEC(1, "No UI target, skipping!");
-        return call_orig();
-    }
-
     sdk::FSlateResource* slate_resource = nullptr;
+    auto rtm = g_hook->get_render_target_manager();
 
     if (slate_viewport != nullptr) {
         slate_resource = slate_viewport->GetViewportRenderTargetTexture();
     } else {
-        const auto viewport_rt_provider = viewport_info->get_rt_provider(g_hook->get_render_target_manager()->get_render_target());
+        const auto viewport_rt_provider = viewport_info->get_rt_provider(rtm->get_render_target());
 
         if (viewport_rt_provider == nullptr) {
             SPDLOG_INFO_EVERY_N_SEC(1, "No viewport RT provider, skipping!");
@@ -6048,10 +6051,33 @@ void* FFakeStereoRenderingHook::slate_draw_window_render_thread(void* renderer, 
         SPDLOG_INFO_EVERY_N_SEC(1, "No slate resource, skipping!");
         return call_orig();
     }
-    
+
+    const auto old_texture = slate_resource->get_mutable_resource();
+
+    if (old_texture != nullptr && !IsBadReadPtr(old_texture, sizeof(void*)) && rtm->get_render_target() == nullptr) {
+        FRHITexture2D::set_vtable(*(void**)old_texture);
+        rtm->set_render_target(old_texture);
+        SPDLOG_WARN_ONCE("[SlateRHIRenderer::DrawWindow_RenderThread] Adopting Slate viewport texture as render target fallback");
+    }
+
+    const auto ui_target = rtm->get_ui_target();
+
+    if (ui_target == nullptr) {
+        SPDLOG_INFO_EVERY_N_SEC(1, "No UI target, drawing Slate first and checking for render target fallback");
+        const auto ret = call_orig();
+        const auto rendered_texture = slate_resource->get_mutable_resource();
+
+        if (rendered_texture != nullptr && !IsBadReadPtr(rendered_texture, sizeof(void*)) && rtm->get_render_target() == nullptr) {
+            FRHITexture2D::set_vtable(*(void**)rendered_texture);
+            rtm->set_render_target(rendered_texture);
+            SPDLOG_WARN_ONCE("[SlateRHIRenderer::DrawWindow_RenderThread] Adopted Slate viewport texture after DrawWindow as render target fallback");
+        }
+
+        return ret;
+    }
+
     // Replace the texture with one we have control over.
     // This isolates the UI to render on our own texture separate from the scene.
-    const auto old_texture = slate_resource->get_mutable_resource();
     slate_resource->get_mutable_resource() = ui_target;
 
     // To be seen if we need to resort to a MidHook on this function if the parameters

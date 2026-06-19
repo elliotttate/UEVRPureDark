@@ -47,6 +47,19 @@ bool RenderTargetPoolHook::hook() {
     SPDLOG_INFO("Performing hook...");
 
     if (is_ue5) {
+        const auto find_free_element_return = sdk::FRenderTargetPool::get_find_free_element_return_fn(true);
+        if (find_free_element_return) {
+            m_find_free_element_return_hook = safetyhook::create_inline((void*)*find_free_element_return,
+                                                                        find_free_element_return_hook_ue5);
+            if (m_find_free_element_return_hook) {
+                SPDLOG_INFO("Successfully hooked RenderTargetPool::FindFreeElement TRef-return overload");
+            } else {
+                SPDLOG_ERROR("Failed to hook RenderTargetPool::FindFreeElement TRef-return overload");
+            }
+        } else {
+            SPDLOG_ERROR("Failed to find RenderTargetPool::FindFreeElement TRef-return overload");
+        }
+
         m_find_free_element_hook = safetyhook::create_inline((void*)*find_free_element, find_free_element_hook_ue5);
     } else {
         m_find_free_element_hook = safetyhook::create_inline((void*)*find_free_element, find_free_element_hook);
@@ -111,17 +124,39 @@ bool RenderTargetPoolHook::find_free_element_hook(
     return result;
 }
 
+TRefCountPtr<IPooledRenderTarget>* RenderTargetPoolHook::find_free_element_return_hook_ue5(
+    sdk::FRenderTargetPool* pool,
+    TRefCountPtr<IPooledRenderTarget>* out,
+    sdk::FRHICommandListBase* cmd_list,
+    sdk::FPooledRenderTargetDesc* desc,
+    const wchar_t* name,
+    // these arent uintptrs, just defending against future changes to the size of the params
+    uintptr_t a6, uintptr_t a7, uintptr_t a8, uintptr_t a9, uintptr_t a10)
+{
+    SPDLOG_INFO_ONCE("FRenderTargetPool::FindFreeElement TRef-return (UE5) called for the first time!");
+
+    const auto result = g_hook->m_find_free_element_return_hook.call<TRefCountPtr<IPooledRenderTarget>*>(
+        pool, out, cmd_list, desc, name, a6, a7, a8, a9, a10);
+
+    SPDLOG_INFO_ONCE("Finished calling FRenderTargetPool::FindFreeElement TRef-return! (UE5)");
+
+    g_hook->on_post_find_free_element(pool, desc, result != nullptr ? result : out, name);
+
+    return result;
+}
+
 bool RenderTargetPoolHook::find_free_element_hook_ue5(
     sdk::FRenderTargetPool* pool,
+    sdk::FRHICommandListBase* cmd_list,
     sdk::FPooledRenderTargetDesc* desc,
     TRefCountPtr<IPooledRenderTarget>* out,
     const wchar_t* name,
     // these arent uintptrs, just defending against future changes to the size of the params
-    uintptr_t a5, uintptr_t a6, uintptr_t a7, uintptr_t a8, uintptr_t a9, uintptr_t a10)
+    uintptr_t a6, uintptr_t a7, uintptr_t a8, uintptr_t a9, uintptr_t a10)
 {
     SPDLOG_INFO_ONCE("FRenderTargetPool::FindFreeElement (UE5) called for the first time!");
 
-    const auto result = g_hook->m_find_free_element_hook.call<bool>(pool, desc, out, name, a6, a7, a8, a9, a10);
+    const auto result = g_hook->m_find_free_element_hook.call<bool>(pool, cmd_list, desc, out, name, a6, a7, a8, a9, a10);
 
     SPDLOG_INFO_ONCE("Finished calling FRenderTargetPool::FindFreeElement! (UE5)");
 

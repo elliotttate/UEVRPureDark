@@ -31,11 +31,69 @@
 #include "LicenseStrings.hpp"
 #include "mods/FrameworkConfig.hpp"
 #include "Framework.hpp"
+#include "render/RenderDocCaptureControl.hpp"
+#include "render/RenderDocCaptureService.hpp"
 
 namespace fs = std::filesystem;
 using namespace std::literals;
 
 std::unique_ptr<Framework> g_framework{};
+
+namespace {
+bool should_suppress_openxr_rehook_guard() {
+    auto vr = VR::get();
+
+    if (vr == nullptr) {
+        return false;
+    }
+
+    const auto runtime = vr->get_runtime();
+
+    if (runtime == nullptr || !runtime->is_openxr()) {
+        return false;
+    }
+
+    const auto openxr = vr->get_openxr_runtime();
+
+    if (openxr == nullptr) {
+        return false;
+    }
+
+    const auto has_openxr_session = openxr->instance != XR_NULL_HANDLE && openxr->session != XR_NULL_HANDLE;
+    const auto ready_wedge = openxr->session_state == XR_SESSION_STATE_READY &&
+        has_openxr_session &&
+        (openxr->session_ready || openxr->frame_synced || openxr->frame_began || openxr->got_first_poses) &&
+        !openxr->got_first_valid_poses;
+    const auto active_session =
+        has_openxr_session &&
+        (openxr->session_state == XR_SESSION_STATE_SYNCHRONIZED ||
+         openxr->session_state == XR_SESSION_STATE_VISIBLE ||
+         openxr->session_state == XR_SESSION_STATE_FOCUSED) &&
+        (openxr->ever_submitted || openxr->got_first_valid_poses || openxr->frame_synced || openxr->frame_began);
+
+    if (!ready_wedge && !active_session) {
+        return false;
+    }
+
+    static auto last_log = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+
+    if (last_log.time_since_epoch().count() == 0 || now - last_log >= std::chrono::seconds(2)) {
+        last_log = now;
+        spdlog::warn(
+            "[Framework] Suppressing D3D rehook while OpenXR session is active. session_state={} session_ready={} ever_submitted={} frame_synced={} frame_began={} got_first_poses={} got_first_valid_poses={}",
+            static_cast<uint32_t>(openxr->session_state),
+            openxr->session_ready,
+            openxr->ever_submitted,
+            openxr->frame_synced,
+            openxr->frame_began,
+            openxr->got_first_poses,
+            openxr->got_first_valid_poses);
+    }
+
+    return true;
+}
+} // namespace
 
 UEVRSharedMemory::UEVRSharedMemory() {
     spdlog::info("Shared memory constructor!");
@@ -107,6 +165,14 @@ void Framework::hook_monitor() {
             }
 
             if (!m_has_last_chance && now - m_last_chance_time > std::chrono::seconds(1)) {
+                if (should_suppress_openxr_rehook_guard()) {
+                    m_last_present_time = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                    m_last_message_time = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                    m_last_chance_time = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+                    m_has_last_chance = true;
+                    return;
+                }
+
                 spdlog::info("Sending rehook request for D3D");
 
                 // hook_d3d12 always gets called first.
@@ -209,6 +275,37 @@ Framework::Framework(HMODULE framework_module)
     spdlog::info("Game Module Addr: {:x}", (uintptr_t)m_game_module);
     spdlog::info("Game Module Size: {:x}", module_size);
 
+    {
+        const bool rd_bootstrap_enabled = []() {
+            char v[8]{};
+            return GetEnvironmentVariableA("UEVR_RENDERDOC_BOOTSTRAP", v, sizeof(v)) > 0
+                   && v[0] != '\0' && v[0] != '0';
+        }();
+        if (rd_bootstrap_enabled) {
+            auto rd_result = uevr_renderdoc_bootstrap();
+            if (rd_result.api_loaded) {
+                spdlog::info("[RenderDoc] integration READY: v{}.{}.{} (preloaded={} loaded_by_uevr={} capture_safe={} d3d12_loaded_before={} dxgi_loaded_before={})",
+                             rd_result.api_version_major, rd_result.api_version_minor,
+                             rd_result.api_version_patch, rd_result.was_preloaded,
+                             rd_result.late_loaded, rd_result.capture_safe,
+                             rd_result.d3d12_was_loaded, rd_result.dxgi_was_loaded);
+                uevr::renderdoc_capture::refresh_hooks();
+                uevr_renderdoc_start_capture_watcher();
+                if (!rd_result.capture_safe) {
+                    spdlog::warn("[RenderDoc] capture_safe=DEGRADED: RenderDoc was initialized after "
+                                 "graphics modules were already present. Status/UI queries work, but "
+                                 "live captures may be incomplete. For full embedded capture, load "
+                                 "UEVR/RenderDoc before the game creates D3D12/DXGI objects with "
+                                 "UEVRRenderDocLauncher.exe.");
+                }
+            } else {
+                spdlog::warn("[RenderDoc] UEVR_RENDERDOC_BOOTSTRAP=1 but the RenderDoc API failed to "
+                             "load. Set UEVR_LOAD_RENDERDOC_DLL=1 to late-load renderdoc.dll, or "
+                             "launch via UEVRRenderDocLauncher.exe.");
+            }
+        }
+    }
+
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
 
@@ -273,6 +370,25 @@ Framework::Framework(HMODULE framework_module)
     m_last_message_time = std::chrono::steady_clock::time_point{}; // Instantly send the first message
     m_last_chance_time = std::chrono::steady_clock::time_point{}; // Instantly send the first message
     m_has_last_chance = false;
+
+    {
+        char prehook[8]{};
+        const bool prehook_d3d12 =
+            GetEnvironmentVariableA("UEVR_RENDERDOC_PREHOOK_D3D12", prehook, sizeof(prehook)) > 0
+            && prehook[0] != '\0' && prehook[0] != '0';
+        if (prehook_d3d12) {
+            spdlog::info("[RenderDoc] prehooking D3D12 before launcher resumes the game main thread");
+            if (hook_d3d12()) {
+                m_last_present_time = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                m_last_message_time = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                m_last_chance_time = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+                m_has_last_chance = true;
+                spdlog::info("[RenderDoc] early D3D12 prehook installed");
+            } else {
+                spdlog::warn("[RenderDoc] early D3D12 prehook failed; first-device proof may fail");
+            }
+        }
+    }
 
     m_uevr_shared_memory = std::make_unique<UEVRSharedMemory>();
     m_command_thread = std::make_unique<std::jthread>([this](std::stop_token s) {

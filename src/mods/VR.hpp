@@ -46,6 +46,32 @@ public:
     bool mDebug3 = false;
     int mDebug5 = 0;
 
+    // AFW debug buffer visualizer, cycled with Ctrl+Shift+V.
+    int afw_debug_view = 0;
+    static constexpr int afw_debug_view_count = 10;
+    static const char* afw_debug_view_name(int view) {
+        switch (view) {
+        case 0: return "off";
+        case 1: return "combined/dense motion vectors";
+        case 2: return "combined/dense motion vectors boosted";
+        case 3: return "camera reconstruction motion vectors";
+        case 4: return "depth";
+        case 5: return "source velocity direction";
+        case 6: return "source velocity X";
+        case 7: return "source velocity Y";
+        case 8: return "source velocity magnitude";
+        case 9: return "source velocity validity";
+        default: return "unknown";
+        }
+    }
+    // Ctrl+Shift+T: transpose ClipToPrevClip in the velocity combine (test matrix convention).
+    bool afw_combine_transpose = false;
+    // Reconstruct camera motion from depth for the whole frame. Default OFF means source/object velocity is used
+    // where valid and depth reconstruction fills the background; Ctrl+Shift+R toggles camera-only reconstruction.
+    bool afw_force_reconstruct = false;
+    // Ctrl+Shift+D: one-shot request to dump the bridged raw velocity (inline copy) to disk.
+    bool afw_dump_raw_velocity_request = false;
+
     uint32_t render_size[2] = {0, 0};
 
     std::map <NVSDK_NGX_Handle*, NVSDK_NGX_Feature> vrDLSSHandleMap;
@@ -464,7 +490,7 @@ public:
     }
 
     bool is_using_afw() const {
-        return m_rendering_method->value() == RenderingMethod::ALTERNATE_FRAMEWARP;
+        return m_rendering_method->value() == RenderingMethod::ALTERNATE_FRAMEWARP && d3d12Renderer != nullptr;
     }
 
     SynchronizeStage get_synchronize_stage() {

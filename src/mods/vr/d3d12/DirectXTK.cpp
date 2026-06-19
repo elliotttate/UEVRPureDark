@@ -1,6 +1,23 @@
 #include "DirectXTK.hpp"
 
 namespace d3d12 {
+namespace {
+void transition_resource(ID3D12GraphicsCommandList* command_list, ID3D12Resource* resource,
+                         D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+    if (command_list == nullptr || resource == nullptr || before == after) {
+        return;
+    }
+
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = resource;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = before;
+    barrier.Transition.StateAfter = after;
+    command_list->ResourceBarrier(1, &barrier);
+}
+}
+
 void render_srv_to_rtv(
     DirectX::DX12::SpriteBatch* batch,
     ID3D12GraphicsCommandList* command_list, 
@@ -34,17 +51,11 @@ void render_srv_to_rtv(
     scissor_rect.right = (LONG)dst_desc.Width;
     scissor_rect.bottom = (LONG)dst_desc.Height;
 
-    // Transition dst to D3D12_RESOURCE_STATE_RENDER_TARGET
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = dst.texture.Get();
-
-    if (dst_state != D3D12_RESOURCE_STATE_RENDER_TARGET) {
-        barrier.Transition.StateBefore = src_state;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        command_list->ResourceBarrier(1, &barrier);
+    const bool same_resource = src.texture.Get() == dst.texture.Get();
+    if (!same_resource) {
+        transition_resource(command_list, src.texture.Get(), src_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }
+    transition_resource(command_list, dst.texture.Get(), dst_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
     // Set RTV to backbuffer
     D3D12_CPU_DESCRIPTOR_HANDLE rtv_heaps[] = { dst.get_rtv() };
@@ -69,11 +80,9 @@ void render_srv_to_rtv(
 
     batch->End();
 
-    // Transition dst to dst_state
-    if (dst_state != D3D12_RESOURCE_STATE_RENDER_TARGET) {
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        barrier.Transition.StateAfter = dst_state;
-        command_list->ResourceBarrier(1, &barrier);
+    transition_resource(command_list, dst.texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, dst_state);
+    if (!same_resource) {
+        transition_resource(command_list, src.texture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, src_state);
     }
 }
 
@@ -111,17 +120,11 @@ void render_srv_to_rtv(
     scissor_rect.right = (LONG)dst_desc.Width;
     scissor_rect.bottom = (LONG)dst_desc.Height;
 
-    // Transition dst to D3D12_RESOURCE_STATE_RENDER_TARGET
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = dst.texture.Get();
-
-    if (dst_state != D3D12_RESOURCE_STATE_RENDER_TARGET) {
-        barrier.Transition.StateBefore = src_state;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        command_list->ResourceBarrier(1, &barrier);
+    const bool same_resource = src.texture.Get() == dst.texture.Get();
+    if (!same_resource) {
+        transition_resource(command_list, src.texture.Get(), src_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }
+    transition_resource(command_list, dst.texture.Get(), dst_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
     // Set RTV to backbuffer
     D3D12_CPU_DESCRIPTOR_HANDLE rtv_heaps[] = { dst.get_rtv() };
@@ -154,11 +157,9 @@ void render_srv_to_rtv(
 
     batch->End();
 
-    // Transition dst to dst_state
-    if (dst_state != D3D12_RESOURCE_STATE_RENDER_TARGET) {
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        barrier.Transition.StateAfter = dst_state;
-        command_list->ResourceBarrier(1, &barrier);
+    transition_resource(command_list, dst.texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, dst_state);
+    if (!same_resource) {
+        transition_resource(command_list, src.texture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, src_state);
     }
 }
 
@@ -197,17 +198,11 @@ void render_srv_to_rtv(
     scissor_rect.right = (LONG)dst_desc.Width;
     scissor_rect.bottom = (LONG)dst_desc.Height;
 
-    // Transition dst to D3D12_RESOURCE_STATE_RENDER_TARGET
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = dst.texture.Get();
-
-    if (dst_state != D3D12_RESOURCE_STATE_RENDER_TARGET) {
-        barrier.Transition.StateBefore = src_state;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        command_list->ResourceBarrier(1, &barrier);
+    const bool same_resource = src.texture.Get() == dst.texture.Get();
+    if (!same_resource) {
+        transition_resource(command_list, src.texture.Get(), src_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }
+    transition_resource(command_list, dst.texture.Get(), dst_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
     // Set RTV to backbuffer
     D3D12_CPU_DESCRIPTOR_HANDLE rtv_heaps[] = { dst.get_rtv() };
@@ -246,11 +241,9 @@ void render_srv_to_rtv(
 
     batch->End();
 
-    // Transition dst to dst_state
-    if (dst_state != D3D12_RESOURCE_STATE_RENDER_TARGET) {
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        barrier.Transition.StateAfter = dst_state;
-        command_list->ResourceBarrier(1, &barrier);
+    transition_resource(command_list, dst.texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, dst_state);
+    if (!same_resource) {
+        transition_resource(command_list, src.texture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, src_state);
     }
 }
 }

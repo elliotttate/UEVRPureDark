@@ -10,6 +10,8 @@
 #include "WindowFilter.hpp"
 #include "Framework.hpp"
 
+#include "render/RenderDocCaptureService.hpp"
+
 #include "D3D12Hook.hpp"
 
 static D3D12Hook* g_d3d12_hook = nullptr;
@@ -534,13 +536,55 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
     return result;
 }
 
+namespace {
+
+bool renderdoc_active_pair_tracking_enabled() {
+    static const bool enabled =
+        uevr::renderdoc_capture::env_truthy_w(L"UEVR_RENDERDOC_BOOTSTRAP") ||
+        uevr::renderdoc_capture::env_truthy_w(L"UEVR_RENDERDOC_TRACK_ACTIVE_PAIR");
+    return enabled;
+}
+
+void renderdoc_update_active_pair_on_present(IDXGISwapChain3* swap_chain) {
+    if (!renderdoc_active_pair_tracking_enabled() || !uevr::renderdoc_capture::is_api_loaded()) {
+        return;
+    }
+
+    if (swap_chain == nullptr) {
+        return;
+    }
+
+    uevr::renderdoc_capture::CapturePair pair{};
+
+    ID3D12Device* swapchain_device{};
+    if (SUCCEEDED(swap_chain->GetDevice(IID_PPV_ARGS(&swapchain_device))) && swapchain_device != nullptr) {
+        pair.device = static_cast<void*>(swapchain_device);
+        swapchain_device->Release();
+    }
+
+    DXGI_SWAP_CHAIN_DESC sc_desc{};
+    if (SUCCEEDED(swap_chain->GetDesc(&sc_desc))) {
+        pair.window = static_cast<void*>(sc_desc.OutputWindow);
+    }
+
+    if (pair.device != nullptr && pair.window != nullptr) {
+        uevr::renderdoc_capture::set_active_window(pair);
+    }
+}
+
+} // namespace
+
 HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, UINT sync_interval, UINT flags) {
+    renderdoc_update_active_pair_on_present(swap_chain);
+
     std::scoped_lock _{g_framework->get_hook_monitor_mutex()};
     
     return D3D12Hook::present_internal(swap_chain, sync_interval, flags, nullptr, false);
 }
 
 HRESULT WINAPI D3D12Hook::present1(IDXGISwapChain3* swap_chain, UINT sync_interval, UINT flags, DXGI_PRESENT_PARAMETERS* params) {
+    renderdoc_update_active_pair_on_present(swap_chain);
+
     std::scoped_lock _{g_framework->get_hook_monitor_mutex()};
 
     return D3D12Hook::present_internal(swap_chain, sync_interval, flags, params, true);

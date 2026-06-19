@@ -35,7 +35,17 @@ endif()
 
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
+# UESDK is a private submodule, so keep the RenderDoc wrapper compatibility fix
+# as a local configure-time patch rather than editing/publishing the submodule.
+include(cmake/ApplyUESDKPatch.cmake)
+
 add_subdirectory(dependencies/submodules/UESDK)
+
+# Embedded RenderDoc capture: defines uevr_attach_full_renderdoc(), which copies
+# or, if UEVR_RENDERDOC_ALWAYS_BUILD=ON, rebuilds renderdoc.dll beside the
+# backend and builds the suspended launcher + smoke validator. Non-fatal if the
+# RenderDoc source/runtime is not present.
+include(cmake/RenderDocFull.cmake)
 """
 
 [target.spdlog]
@@ -164,6 +174,38 @@ type = "plugin"
 sources = ["examples/example_plugin/**.cpp", "examples/example_plugin/**.c"]
 headers = ["examples/example_plugin/**.hpp", "examples/example_plugin/**.h"]
 
+# AFW frame resource tracker: decoupled depth/velocity discovery exposed as a UEVR plugin DLL.
+# Non-recursive globs deliberately EXCLUDE plugins/afw_frame_resources/tools (the offline self-test
+# exe) so its main() does not get pulled into the DLL.
+[target.afw_frame_resources]
+type = "plugin"
+sources = [
+    "plugins/afw_frame_resources/*.cpp",
+    "plugins/afw_frame_resources/providers/*.cpp",
+]
+headers = [
+    "plugins/afw_frame_resources/*.hpp",
+    "plugins/afw_frame_resources/providers/*.hpp",
+    "plugins/afw_frame_resources/include/*.h",
+]
+
+# Offline tier-1 self-test runner. Links ONLY the uevr-free tracker core so the state machine can
+# be verified on the build machine (and in CI) without launching a game. Returns non-zero on FAIL.
+[target.afw_frame_resources_selftest]
+type = "executable"
+sources = [
+    "plugins/afw_frame_resources/FrameResourceTracker.cpp",
+    "plugins/afw_frame_resources/FrameResourceLog.cpp",
+    "plugins/afw_frame_resources/tools/selftest_main.cpp",
+]
+headers = [
+    "plugins/afw_frame_resources/FrameResourceTracker.hpp",
+    "plugins/afw_frame_resources/FrameResourceTypes.hpp",
+    "plugins/afw_frame_resources/FrameResourceLog.hpp",
+]
+include-directories = ["plugins/afw_frame_resources"]
+compile-features = ["cxx_std_23"]
+
 [target.sdk-test]
 type = "shared"
 sources = ["side-projects/sdk-test/**.cpp", "side-projects/sdk-test/**.c"]
@@ -243,7 +285,8 @@ include-directories = [
     "shared/", 
     "src/", 
     "include/", 
-    "${OPENXR_SOURCE_DIR}/src"
+    "${OPENXR_SOURCE_DIR}/src",
+    "dependencies/vendor/renderdoc"
 ]
 compile-options = ["/GS-", "/bigobj", "/EHa", "/MP"]
 compile-features = ["cxx_std_23"]
@@ -299,5 +342,9 @@ add_custom_command(
 add_custom_command(
     TARGET uevr POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:openvr> $<TARGET_FILE_DIR:uevr>)
+
+# Build the RenderDoc launcher + smoke tools and stage renderdoc.dll beside
+# UEVRBackend.dll. No-op if RenderDoc is not available on this machine.
+uevr_attach_full_renderdoc(uevr)
 
 """

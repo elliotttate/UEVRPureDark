@@ -1,0 +1,340 @@
+diff --git a/src/sdk/FRenderTargetPool.cpp b/src/sdk/FRenderTargetPool.cpp
+index ec7783f..3313cc1 100644
+--- a/src/sdk/FRenderTargetPool.cpp
++++ b/src/sdk/FRenderTargetPool.cpp
+@@ -2,6 +2,12 @@
+ 
+ #include <utility/Scan.hpp>
+ #include <utility/String.hpp>
++#include <utility/Module.hpp>
++
++#include <algorithm>
++#include <unordered_map>
++#include <unordered_set>
++#include <vector>
+ 
+ #include "EngineModule.hpp"
+ 
+@@ -26,45 +32,187 @@ std::optional<uintptr_t> FRenderTargetPool::get_find_free_element_fn(bool is_ue5
+                 continue;
+             }
+ 
+-            if (is_ue5) {
+-                const auto ui_target_rt_str = utility::scan_string(module, L"UITargetRT", true);
++            const auto module_size = utility::get_module_size(module);
++            if (!module_size || *module_size == 0) {
++                SPDLOG_INFO("Failed to get module size for {}, skipping", utility::narrow(module_name));
++                continue;
++            }
+ 
+-                if (!ui_target_rt_str) {
+-                    SPDLOG_ERROR("Failed to find UITargetRT string");
+-                    continue;
++            const auto module_start = (uintptr_t)module;
++            const auto module_end = module_start + *module_size;
++            const auto is_in_scanned_module = [module_start, module_end](uintptr_t address) {
++                return address >= module_start && address < module_end;
++            };
++
++            std::vector<std::pair<uintptr_t, uintptr_t>> valid_call_target_ranges{};
++            const auto add_valid_call_target_module = [&valid_call_target_ranges](HMODULE target_module) {
++                if (target_module == nullptr) {
++                    return;
+                 }
+ 
+-                SPDLOG_INFO("Found UITargetRT string at {:x}", *ui_target_rt_str);
++                const auto target_size = utility::get_module_size(target_module);
++                if (!target_size || *target_size == 0) {
++                    return;
++                }
+ 
+-                const auto ui_target_rt_ref = utility::scan_displacement_reference(module, *ui_target_rt_str);
++                const auto start = (uintptr_t)target_module;
++                const auto end = start + *target_size;
++                const auto already_added = std::any_of(
++                    valid_call_target_ranges.begin(), valid_call_target_ranges.end(),
++                    [start, end](const auto& range) {
++                        return range.first == start && range.second == end;
++                    });
+ 
+-                if (!ui_target_rt_ref) {
+-                    SPDLOG_ERROR("Failed to find reference to UITargetRT string");
+-                    continue;
++                if (!already_added) {
++                    valid_call_target_ranges.emplace_back(start, end);
+                 }
++            };
+ 
+-                const auto ui_target_rt_post_instruction = *ui_target_rt_ref + 4; // Skip immediate
++            add_valid_call_target_module(module);
++            add_valid_call_target_module(utility::get_executable());
++            add_valid_call_target_module(sdk::get_ue_module(L"Renderer"));
++            add_valid_call_target_module(sdk::get_ue_module(L"RenderCore"));
+ 
+-                // Scan forward for a call instruction, which is the call to FRenderTargetPool::FindFreeElement
+-                const auto call_insn = utility::find_pattern_in_path((uint8_t*)ui_target_rt_post_instruction, 100, false, "E8 ? ? ? ?");
++            const auto is_valid_call_target = [&valid_call_target_ranges](uintptr_t address) {
++                return std::any_of(
++                    valid_call_target_ranges.begin(), valid_call_target_ranges.end(),
++                    [address](const auto& range) {
++                        return address >= range.first && address < range.second;
++                    });
++            };
+ 
+-                if (!call_insn) {
+-                    SPDLOG_ERROR("Failed to find call to FRenderTargetPool::FindFreeElement");
+-                    continue;
+-                }
++            if (is_ue5) {
++                const std::vector<std::wstring> anchors{
++                    // Direct UE5 GRenderTargetPool.FindFreeElement(..., Out, TEXT(...)) callsites.
++                    // These survive in stripped 5.5/5.6 builds more reliably than UITargetRT.
++                    L"Benchmark0",
++                    L"ReflectionEnvs",
++                    L"IndirectLightingCache_0",
++                    L"VolumetricRenderTarget.Tracing",
++                    L"SkyAtmosphere.TransmittanceLut",
++                    L"Shadow.Virtual.PhysicalPagePool",
++                    L"PhysicalTexture",
++                    L"SceneCaptureTarget",
++                    // Keep the old anchor as a fallback for titles where it still exists.
++                    L"UITargetRT",
++                };
++                constexpr size_t kMaxInstructionsAfterName = 20;
++                std::unordered_map<uintptr_t, size_t> candidate_votes{};
++                std::unordered_map<uintptr_t, std::vector<std::wstring>> candidate_anchors{};
++
++                for (const auto& anchor : anchors) {
++                    const auto strings = utility::scan_strings(module, anchor, true);
++                    if (strings.empty()) {
++                        SPDLOG_INFO("Failed to find {} string", utility::narrow(anchor));
++                        continue;
++                    }
+ 
+-                SPDLOG_INFO("Found FRenderTargetPool::FindFreeElement call at {:x}", call_insn->addr);
++                    SPDLOG_INFO("{} {} strings found", strings.size(), utility::narrow(anchor));
+ 
+-                const auto result = utility::calculate_absolute(call_insn->addr + 1);
++                    for (const auto string_addr : strings) {
++                        if (!is_in_scanned_module(string_addr)) {
++                            continue;
++                        }
++
++                        SPDLOG_INFO("Found {} string at {:x}", utility::narrow(anchor), string_addr);
+ 
+-                if (!result) {
+-                    SPDLOG_ERROR("Failed to calculate absolute address from call instruction");
++                        std::vector<uintptr_t> string_refs{};
++                        auto string_ref = utility::scan_displacement_reference(module, string_addr, is_in_scanned_module);
++                        while (string_ref && is_in_scanned_module(*string_ref)) {
++                            string_refs.push_back(*string_ref);
++
++                            const auto next_start = *string_ref + 4;
++                            if (next_start >= module_end) {
++                                break;
++                            }
++
++                            string_ref = utility::scan_displacement_reference(
++                                next_start, module_end - next_start, string_addr, is_in_scanned_module);
++                        }
++
++                        if (string_refs.empty()) {
++                            SPDLOG_ERROR("Failed to find reference to {} string", utility::narrow(anchor));
++                            continue;
++                        }
++
++                        std::unordered_set<uintptr_t> anchor_candidates{};
++
++                        for (const auto ref : string_refs) {
++                            const auto resolved = utility::resolve_instruction(ref);
++                            if (!resolved || !is_in_scanned_module(resolved->addr)) {
++                                SPDLOG_ERROR("Failed to resolve instruction from {} reference", utility::narrow(anchor));
++                                continue;
++                            }
++
++                            const auto post_instruction = resolved->addr + resolved->instrux.Length;
++                            if (!is_in_scanned_module(post_instruction)) {
++                                continue;
++                            }
++
++                            utility::exhaustive_decode((uint8_t*)post_instruction, kMaxInstructionsAfterName, [&](INSTRUX& instr, uintptr_t ip) {
++                                if (!is_in_scanned_module(ip)) {
++                                    return utility::ExhaustionResult::BREAK;
++                                }
++
++                                if (std::string_view{ instr.Mnemonic }.starts_with("CALL")) {
++                                    std::optional<uintptr_t> candidate{};
++                                    if (*(uint8_t*)ip == 0xE8) {
++                                        candidate = utility::calculate_absolute(ip + 1);
++                                    } else if (instr.Operands[0].Type == ND_OP_MEM) {
++                                        const auto ptr = utility::resolve_displacement(ip);
++                                        if (ptr && is_in_scanned_module(*ptr)) {
++                                            candidate = *(uintptr_t*)*ptr;
++                                        }
++                                    }
++
++                                    if (candidate && is_valid_call_target(*candidate)) {
++                                        anchor_candidates.insert(*candidate);
++                                    }
++
++                                    return utility::ExhaustionResult::STEP_OVER;
++                                }
++
++                                return utility::ExhaustionResult::CONTINUE;
++                            });
++                        }
++
++                        if (anchor_candidates.empty()) {
++                            SPDLOG_ERROR("Failed to find call to FRenderTargetPool::FindFreeElement near {}",
++                                         utility::narrow(anchor));
++                            continue;
++                        }
++
++                        for (const auto candidate : anchor_candidates) {
++                            ++candidate_votes[candidate];
++                            candidate_anchors[candidate].push_back(anchor);
++                        }
++                    }
++                }
++
++                if (candidate_votes.empty()) {
+                     continue;
+                 }
+ 
+-                SPDLOG_INFO("Found FRenderTargetPool::FindFreeElement at {:x}", result);
++                const auto best = std::max_element(
++                    candidate_votes.begin(), candidate_votes.end(),
++                    [](const auto& a, const auto& b) {
++                        if (a.second != b.second) {
++                            return a.second < b.second;
++                        }
++                        return a.first < b.first;
++                    });
++
++                std::string anchors_used{};
++                for (const auto& anchor : candidate_anchors[best->first]) {
++                    if (!anchors_used.empty()) {
++                        anchors_used += ", ";
++                    }
++                    anchors_used += utility::narrow(anchor);
++                }
+ 
+-                return result;
++                SPDLOG_INFO("Found FRenderTargetPool::FindFreeElement at {:x} by consensus votes={} anchors=[{}]",
++                            best->first, best->second, anchors_used);
++                return best->first;
+             }
+ 
+             // Other strings can be used if this one falls flat later on
+@@ -147,4 +295,94 @@ std::optional<uintptr_t> FRenderTargetPool::get_find_free_element_fn(bool is_ue5
+ 
+     return result;
+ }
+-}
+\ No newline at end of file
++
++std::optional<uintptr_t> FRenderTargetPool::get_find_free_element_return_fn(bool is_ue5) {
++    if (!is_ue5) {
++        return std::nullopt;
++    }
++
++    static auto result = []() -> std::optional<uintptr_t> {
++        const auto bool_overload = get_find_free_element_fn(true);
++        if (!bool_overload) {
++            return std::nullopt;
++        }
++
++        const auto overload_module = utility::get_module_within(Address{ *bool_overload });
++        if (!overload_module) {
++            SPDLOG_ERROR("Failed to identify module for FRenderTargetPool::FindFreeElement bool overload {:x}",
++                         *bool_overload);
++            return std::nullopt;
++        }
++
++        const auto overload_module_size = utility::get_module_size(*overload_module);
++        if (!overload_module_size || *overload_module_size == 0) {
++            SPDLOG_ERROR("Failed to get module size for FRenderTargetPool::FindFreeElement bool overload {:x}",
++                         *bool_overload);
++            return std::nullopt;
++        }
++
++        const auto module_start = (uintptr_t)*overload_module;
++        const auto module_end = module_start + *overload_module_size;
++        if (*bool_overload < module_start || *bool_overload >= module_end) {
++            SPDLOG_ERROR("Rejected FRenderTargetPool::FindFreeElement bool overload outside module range {:x}",
++                         *bool_overload);
++            return std::nullopt;
++        }
++
++        // UE5 has two exported/inlined shapes:
++        //   bool FindFreeElement(RHICmdList, Desc, Out, Name)
++        //   TRefCountPtr FindFreeElement(RHICmdList, Desc, Name)
++        // Direct named pool users usually hit the bool overload. RDG's
++        // AllocatePooledRenderTargetRHI hits the TRef-returning overload. In
++        // 5.5/5.6 shipping builds the TRef overload is emitted immediately
++        // before the bool overload, separated by an INT3 padding run. Walk back
++        // over two padding runs to find the prior function boundary instead of
++        // hardcoding a build-specific offset.
++        constexpr uintptr_t scan_back = 0x400;
++        const auto min_addr = (std::max)(module_start, *bool_overload > scan_back ? *bool_overload - scan_back : 0);
++        uintptr_t cursor = *bool_overload - 1;
++        uint32_t padding_runs = 0;
++
++        while (cursor > min_addr) {
++            if (*(uint8_t*)cursor != 0xCC) {
++                --cursor;
++                continue;
++            }
++
++            const auto run_end = cursor;
++            while (cursor > min_addr && *((uint8_t*)cursor - 1) == 0xCC) {
++                --cursor;
++            }
++            const auto run_start = cursor;
++            const auto run_len = run_end - run_start + 1;
++
++            if (run_len >= 4) {
++                ++padding_runs;
++                if (padding_runs == 2) {
++                    const auto candidate = run_end + 1;
++                    if (candidate >= module_start && candidate < *bool_overload && *(uint8_t*)candidate != 0xCC) {
++                        SPDLOG_INFO("Found UE5 TRef-returning FRenderTargetPool::FindFreeElement at {:x} (bool overload {:x})",
++                                    candidate, *bool_overload);
++                        return candidate;
++                    }
++
++                    SPDLOG_ERROR("Rejected UE5 TRef-returning FRenderTargetPool::FindFreeElement candidate {:x}",
++                                 candidate);
++                    return std::nullopt;
++                }
++            }
++
++            if (cursor == min_addr) {
++                break;
++            }
++            --cursor;
++        }
++
++        SPDLOG_ERROR("Failed to derive UE5 TRef-returning FRenderTargetPool::FindFreeElement from bool overload {:x}",
++                     *bool_overload);
++        return std::nullopt;
++    }();
++
++    return result;
++}
++}
+diff --git a/src/sdk/FRenderTargetPool.hpp b/src/sdk/FRenderTargetPool.hpp
+index 7ac547b..bd44a48 100644
+--- a/src/sdk/FRenderTargetPool.hpp
++++ b/src/sdk/FRenderTargetPool.hpp
+@@ -7,7 +7,8 @@ namespace sdk {
+ class FRenderTargetPool {
+ public:
+     static std::optional<uintptr_t> get_find_free_element_fn(bool is_ue5 = false);
++    static std::optional<uintptr_t> get_find_free_element_return_fn(bool is_ue5 = false);
+ 
+ private:
+ };
+-}
+\ No newline at end of file
++}

@@ -1,6 +1,10 @@
 #include <d3dcompiler.h>
 
 #include <openvr.h>
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <utility/String.hpp>
 #include <utility/ScopeGuard.hpp>
 #include <utility/Logging.hpp>
@@ -16,12 +20,427 @@
 
 #include "d3d12/DirectXTK.hpp"
 
+#include "shaders/Compiled/ue_velocity_combine_cs_VelocityCombineCS.inc"
+#include "shaders/Compiled/afw_debug_visualize_cs_DebugVisualizeCS.inc"
+
+#include "AFWFrameResourcesBridge.hpp"
 #include "D3D12Component.hpp"
 
 //#define AFR_DEPTH_TEMP_DISABLED
 
 constexpr auto ENGINE_SRC_DEPTH = D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 constexpr auto ENGINE_SRC_COLOR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+namespace {
+bool afw_env_bool(const char* name, bool default_value) {
+    if (const char* value = std::getenv(name); value != nullptr) {
+        if (_stricmp(value, "0") == 0 || _stricmp(value, "false") == 0 || _stricmp(value, "off") == 0 ||
+            _stricmp(value, "no") == 0) {
+            return false;
+        }
+
+        if (_stricmp(value, "1") == 0 || _stricmp(value, "true") == 0 || _stricmp(value, "on") == 0 ||
+            _stricmp(value, "yes") == 0) {
+            return true;
+        }
+    }
+
+    return default_value;
+}
+
+bool afw_d3d12_allow_swapchain_backbuffer_fallback() {
+    return afw_env_bool("UEVR_AFW_ALLOW_SWAPCHAIN_BACKBUFFER", false);
+}
+
+float afw_env_float(const char* name, float default_value) {
+    if (const char* value = std::getenv(name); value != nullptr && *value != '\0') {
+        char* end{};
+        const float parsed = std::strtof(value, &end);
+        if (end != value) {
+            return parsed;
+        }
+    }
+
+    return default_value;
+}
+
+int afw_env_int(const char* name, int default_value) {
+    if (const char* value = std::getenv(name); value != nullptr && *value != '\0') {
+        char* end{};
+        const long parsed = std::strtol(value, &end, 10);
+        if (end != value) {
+            return static_cast<int>(parsed);
+        }
+    }
+
+    return default_value;
+}
+
+enum class AfwBridgeVelocityMode {
+    Combined,
+    Raw,
+    Off,
+};
+
+AfwBridgeVelocityMode afw_bridge_velocity_mode() {
+    if (const char* value = std::getenv("UEVR_AFW_VELOCITY_MODE"); value != nullptr && *value != '\0') {
+        if (_stricmp(value, "combined") == 0 || _stricmp(value, "combine") == 0 ||
+            _stricmp(value, "dense") == 0 || _stricmp(value, "dlss") == 0) {
+            return AfwBridgeVelocityMode::Combined;
+        }
+
+        if (_stricmp(value, "raw") == 0 || _stricmp(value, "copy_raw") == 0 ||
+            _stricmp(value, "passthrough") == 0 || _stricmp(value, "pass_through") == 0) {
+            return AfwBridgeVelocityMode::Raw;
+        }
+
+        if (_stricmp(value, "off") == 0 || _stricmp(value, "disabled") == 0 ||
+            _stricmp(value, "disable") == 0 || _stricmp(value, "none") == 0) {
+            return AfwBridgeVelocityMode::Off;
+        }
+
+        SPDLOG_WARNING_EVERY_N_SEC(1, "[VR] Unknown UEVR_AFW_VELOCITY_MODE='{}'; using combined", value);
+    }
+
+    // Backward compatibility for the original boolean switch: disabling the combine means
+    // "copy the raw helper velocity" instead of disabling velocity entirely.
+    if (!afw_env_bool("UEVR_AFW_COMBINE_UE_VELOCITY", true)) {
+        return AfwBridgeVelocityMode::Raw;
+    }
+
+    return AfwBridgeVelocityMode::Combined;
+}
+
+const char* afw_bridge_velocity_mode_name(AfwBridgeVelocityMode mode) {
+    switch (mode) {
+    case AfwBridgeVelocityMode::Combined:
+        return "combined";
+    case AfwBridgeVelocityMode::Raw:
+        return "raw";
+    case AfwBridgeVelocityMode::Off:
+        return "off";
+    default:
+        return "unknown";
+    }
+}
+
+const char* afw_motion_vectors_type_name(MVType type) {
+    switch (type) {
+    case Normal:
+        return "Normal";
+    case FromOtherEye:
+        return "FromOtherEye";
+    case ObjectOnly:
+        return "ObjectOnly";
+    default:
+        return "Unknown";
+    }
+}
+
+MVType afw_select_motion_vectors_type(FrameWarpMode mode, bool bridge_velocity_used, bool bridge_velocity_combined, bool fix_dlss) {
+    if (const char* value = std::getenv("UEVR_AFW_MOTION_VECTORS_TYPE"); value != nullptr && *value != '\0') {
+        if (_stricmp(value, "normal") == 0) {
+            return Normal;
+        }
+        if (_stricmp(value, "from_other_eye") == 0 || _stricmp(value, "fromothereye") == 0 ||
+            _stricmp(value, "other_eye") == 0 || _stricmp(value, "othereye") == 0) {
+            return FromOtherEye;
+        }
+        if (_stricmp(value, "object_only") == 0 || _stricmp(value, "objectonly") == 0) {
+            return ObjectOnly;
+        }
+    }
+
+    if (bridge_velocity_combined) {
+        return Normal;
+    }
+
+    if (fix_dlss) {
+        return Normal;
+    }
+
+    // PDAFW's Normal mode is same-eye temporal. With DLSS off, Alternate/Combined AFW synthesize
+    // the other eye, so keep the original cross-eye motion-vector interpretation even when the
+    // helper plugin supplies a velocity texture. Same-eye PreviousFrameWarping is the bridge case
+    // where Normal is the matching contract.
+    if (bridge_velocity_used && mode == PreviousFrameWarping) {
+        return Normal;
+    }
+
+    return FromOtherEye;
+}
+
+bool afw_bridge_velocity_format_allowed(uint32_t format) {
+    // Mirror the plugin's canonical-velocity policy (afw_frame_resources is_canonical_velocity_format):
+    // two-channel 16-bit RG targets (PF_G16R16) plus RGBA16 *UNORM* (PF_A16B16G16R16, the UE5.5/5.6
+    // velocity-depth-encoded variant — what AFW2 uses). RGBA16 FLOAT is HDR colour, never velocity.
+    switch (static_cast<DXGI_FORMAT>(format)) {
+    case DXGI_FORMAT_R16G16_UNORM:
+    case DXGI_FORMAT_R16G16_SNORM:
+    case DXGI_FORMAT_R16G16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_UNORM:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Maps the engine's depth format to a PDAFW-created copy format. Keep combined depth+stencil
+// families typeless so CopyTextureRegion stays within the same format compatibility group.
+DXGI_FORMAT afw_bridge_depth_srv_format(DXGI_FORMAT engine_format) {
+    switch (engine_format) {
+    case DXGI_FORMAT_R32_TYPELESS:
+    case DXGI_FORMAT_D32_FLOAT:
+    case DXGI_FORMAT_R32_FLOAT:
+        return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R16_TYPELESS:
+    case DXGI_FORMAT_D16_UNORM:
+    case DXGI_FORMAT_R16_UNORM:
+        return DXGI_FORMAT_R16_UNORM;
+    case DXGI_FORMAT_R24G8_TYPELESS:
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        return DXGI_FORMAT_R24G8_TYPELESS;
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        return DXGI_FORMAT_R32G8X24_TYPELESS;
+    default:
+        return engine_format; // already concrete + sampleable (engine handed us a resolved format)
+    }
+}
+
+bool afw_bridge_needs_recreate(const TextureDesc& dst, const UEVR_FrameResourceView& src, DXGI_FORMAT format) {
+    if (dst.pTexture == nullptr) {
+        return true;
+    }
+
+    const auto dst_desc = dst.pTexture->GetDesc();
+    return dst_desc.Width != src.width || dst_desc.Height != src.height || dst_desc.Format != format;
+}
+
+bool afw_bridge_ensure_texture(D3D12RendererAPI* renderer, TextureDesc& dst, const UEVR_FrameResourceView& src,
+                               DXGI_FORMAT format, D3D12_RESOURCE_STATES state, bool create_uav, const char* label) {
+    if (renderer == nullptr || src.d3d12_resource == nullptr || src.width == 0 || src.height == 0) {
+        return false;
+    }
+
+    if (!afw_bridge_needs_recreate(dst, src, format)) {
+        return true;
+    }
+
+    // The warp only ever samples these copies (SRV); a UAV on a depth/typeless format is invalid, so
+    // depth passes create_uav=false. Velocity is sampled too, so it also opts out.
+    if (!renderer->CreateTexture(static_cast<int>(src.width), static_cast<int>(src.height), format, state, dst,
+                                 create_uav)) {
+        SPDLOG_ERROR_EVERY_N_SEC(1, "[VR] AFW frame resource bridge failed to create {} texture {}x{} fmt={}",
+                                 label, src.width, src.height, src.format);
+        return false;
+    }
+    if (dst.pTexture != nullptr && label != nullptr) {
+        const std::wstring name = std::wstring{L"UEVR AFW "} + utility::widen(label);
+        dst.pTexture->SetName(name.c_str());
+    }
+
+    return true;
+}
+
+struct AfwBridgeEyeResource {
+    UEVR_FrameResourceView view{};
+    D3D12_BOX source_box{};
+    bool split_side_by_side{false};
+};
+
+AfwBridgeEyeResource afw_bridge_eye_resource(const UEVR_FrameResourceView& src, uint32_t eye_width,
+                                             uint32_t eye_height, EyeIndex eye, bool allow_stereo_source_split) {
+    AfwBridgeEyeResource result{};
+    result.view = src;
+    result.source_box = D3D12_BOX{0, 0, 0, src.width, src.height, 1};
+
+    const bool matches_output_double_wide =
+        eye_width != 0 && eye_height != 0 && src.width == eye_width * 2u && src.height == eye_height;
+    const bool looks_like_stereo_source =
+        allow_stereo_source_split && src.width >= 2u && (src.width % 2u) == 0u && src.height != 0;
+
+    if (matches_output_double_wide || looks_like_stereo_source) {
+        const uint32_t source_eye_width = matches_output_double_wide ? eye_width : (src.width / 2u);
+        const uint32_t left = eye == EyeRight ? source_eye_width : 0u;
+        result.view.width = source_eye_width;
+        result.view.height = src.height;
+        result.source_box.left = left;
+        result.source_box.right = left + source_eye_width;
+        result.split_side_by_side = true;
+    }
+
+    return result;
+}
+
+TextureDesc afw_bridge_source_desc(const UEVR_FrameResourceView& src, ImageType type) {
+    TextureDesc desc{};
+    desc.type = type;
+    desc.pTexture = static_cast<ID3D12Resource*>(src.d3d12_resource);
+    desc.initialState = static_cast<D3D12_RESOURCE_STATES>(src.expected_state);
+    if (desc.initialState == D3D12_RESOURCE_STATE_COMMON) {
+        desc.initialState = type == Depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET;
+    }
+    return desc;
+}
+
+void afw_transition_resource(ID3D12GraphicsCommandList* command_list, ID3D12Resource* resource,
+                             D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after);
+
+void afw_copy_texture_region(ID3D12GraphicsCommandList* command_list, TextureDesc& dst, TextureDesc& src,
+                             const D3D12_BOX& source_box) {
+    if (command_list == nullptr || dst.pTexture == nullptr || src.pTexture == nullptr) {
+        return;
+    }
+
+    auto src_state = src.initialState;
+    if (src_state == D3D12_RESOURCE_STATE_COMMON) {
+        src_state = src.type == Depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET;
+    }
+
+    auto dst_state = dst.initialState;
+    if (dst_state == D3D12_RESOURCE_STATE_COMMON) {
+        dst_state = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+    }
+
+    afw_transition_resource(command_list, src.pTexture, src_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    afw_transition_resource(command_list, dst.pTexture, dst_state, D3D12_RESOURCE_STATE_COPY_DEST);
+
+    D3D12_TEXTURE_COPY_LOCATION dst_location{};
+    dst_location.pResource = dst.pTexture;
+    dst_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst_location.SubresourceIndex = 0;
+
+    D3D12_TEXTURE_COPY_LOCATION src_location{};
+    src_location.pResource = src.pTexture;
+    src_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src_location.SubresourceIndex = 0;
+
+    command_list->CopyTextureRegion(&dst_location, 0, 0, 0, &src_location, &source_box);
+
+    afw_transition_resource(command_list, dst.pTexture, D3D12_RESOURCE_STATE_COPY_DEST, dst_state);
+    afw_transition_resource(command_list, src.pTexture, D3D12_RESOURCE_STATE_COPY_SOURCE, src_state);
+}
+
+void afw_transition_resource(ID3D12GraphicsCommandList* command_list, ID3D12Resource* resource,
+                             D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+    if (command_list == nullptr || resource == nullptr || before == after) {
+        return;
+    }
+
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    barrier.Transition.pResource = resource;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = before;
+    barrier.Transition.StateAfter = after;
+    command_list->ResourceBarrier(1, &barrier);
+}
+
+void afw_uav_barrier(ID3D12GraphicsCommandList* command_list, ID3D12Resource* resource) {
+    if (command_list == nullptr || resource == nullptr) {
+        return;
+    }
+
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    barrier.UAV.pResource = resource;
+    command_list->ResourceBarrier(1, &barrier);
+}
+
+// One-shot debug readback of an RG16F (or any) GPU texture to disk so the combined velocity
+// can be false-colored offline and compared to the engine's DLSSCombinedVelocity reference.
+// Self-contained: own allocator/list/fence on the swapchain queue. Gated + dump-once by the caller.
+void afw_dump_texture_to_disk(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Resource* tex,
+                              D3D12_RESOURCE_STATES before_state, const char* path) {
+    if (device == nullptr || queue == nullptr || tex == nullptr) {
+        return;
+    }
+    const auto desc = tex->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+    UINT num_rows = 0; UINT64 row_size = 0, total = 0;
+    device->GetCopyableFootprints(&desc, 0, 1, 0, &fp, &num_rows, &row_size, &total);
+
+    D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd{}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = total; bd.Height = 1;
+    bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+    if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                               nullptr, IID_PPV_ARGS(&readback)))) {
+        return;
+    }
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> alloc;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc)))) return;
+    if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr, IID_PPV_ARGS(&list)))) return;
+
+    auto barrier = [&](D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
+        D3D12_RESOURCE_BARRIER br{}; br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        br.Transition.pResource = tex; br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        br.Transition.StateBefore = a; br.Transition.StateAfter = b; list->ResourceBarrier(1, &br);
+    };
+    barrier(before_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst{}; dst.pResource = readback.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = fp;
+    D3D12_TEXTURE_COPY_LOCATION src{}; src.pResource = tex;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    barrier(D3D12_RESOURCE_STATE_COPY_SOURCE, before_state);
+    list->Close();
+
+    ID3D12CommandList* lists[] = { list.Get() };
+    queue->ExecuteCommandLists(1, lists);
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) return;
+    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    queue->Signal(fence.Get(), 1);
+    if (fence->GetCompletedValue() < 1) { fence->SetEventOnCompletion(1, ev); WaitForSingleObject(ev, 5000); }
+    CloseHandle(ev);
+
+    void* mapped = nullptr; D3D12_RANGE rr{0, static_cast<SIZE_T>(total)};
+    if (SUCCEEDED(readback->Map(0, &rr, &mapped)) && mapped != nullptr) {
+        std::ofstream f(path, std::ios::binary);
+        if (f) {
+            uint32_t hdr[4] = { static_cast<uint32_t>(desc.Width), static_cast<uint32_t>(desc.Height),
+                                fp.Footprint.RowPitch, static_cast<uint32_t>(desc.Format) };
+            f.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
+            f.write(reinterpret_cast<const char*>(mapped), static_cast<std::streamsize>(total));
+        }
+        D3D12_RANGE wr{0, 0}; readback->Unmap(0, &wr);
+    }
+}
+
+struct AFWVelocityCombineConstants {
+    float clip_to_prev_clip[16]{};
+    uint32_t output_size[2]{};
+    float inv_output_size[2]{};
+    uint32_t velocity_size[2]{};
+    uint32_t depth_size[2]{};
+    uint32_t velocity_origin[2]{};
+    uint32_t velocity_extent[2]{};
+    uint32_t depth_origin[2]{};
+    uint32_t depth_extent[2]{};
+    uint32_t force_reconstruct{};
+    uint32_t pad[3]{};
+};
+
+static_assert(sizeof(AFWVelocityCombineConstants) == 36 * sizeof(uint32_t));
+
+struct AFWDebugVizConstants {
+    // 0 velocity(pixel RG hue), 1 depth(R), 2 decoded source velocity hue,
+    // 3 decoded source velocity X, 4 decoded source velocity Y,
+    // 5 decoded source velocity magnitude, 6 source velocity validity.
+    uint32_t mode{};
+    float scale{1.0f};
+    uint32_t input_size[2]{};
+    uint32_t output_size[2]{};
+    uint32_t pad[2]{};
+};
+static_assert(sizeof(AFWDebugVizConstants) == 8 * sizeof(uint32_t));
+} // namespace
 
 namespace vrmod {
 vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
@@ -64,6 +483,15 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
     if (vr->is_extreme_compatibility_mode_enabled()) {
         backbuffer = real_backbuffer;
+    }
+
+    if (backbuffer == nullptr && (vr->is_stereo_emulation_enabled() || afw_d3d12_allow_swapchain_backbuffer_fallback())) {
+        backbuffer = real_backbuffer;
+        if (vr->is_stereo_emulation_enabled()) {
+            SPDLOG_INFO_EVERY_N_SEC(1, "[VR] Stereo emulation: using DXGI swapchain backbuffer for D3D12 frame");
+        } else {
+            SPDLOG_WARNING_EVERY_N_SEC(1, "[VR] Fake stereo render target unavailable; using DXGI swapchain backbuffer for D3D12 diagnostic frame");
+        }
     }
 
     if (backbuffer == nullptr) {
@@ -191,6 +619,20 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             D3D12_RESOURCE_STATE_RENDER_TARGET,
             D3D12_RESOURCE_STATE_RENDER_TARGET
         );
+
+        if (vr->afw_debug_view != 0) {
+            if (vr->d3d12Renderer == nullptr) {
+                SPDLOG_WARNING_EVERY_N_SEC(2, "[VR] OpenXR frame-resource debug view requested but PDAFW D3D12 renderer is unavailable");
+                return;
+            }
+
+            TextureDesc debug_target{};
+            debug_target.pTexture = render_target;
+            debug_target.initialState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            vr->d3d12Renderer->SetupTextureDesc(debug_target);
+            render_frame_resource_debug_view(vr, commands.cmd_list.Get(), vr->afw_debug_view,
+                                             debug_target, nullptr);
+        }
     };
 
     // For copying the real backbuffer if we need to
@@ -439,6 +881,16 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     // #############################
 
     bool is_using_afw = vr->is_using_afw();
+    static bool s_applied_debug_view_env = false;
+    if (!s_applied_debug_view_env) {
+        s_applied_debug_view_env = true;
+        if (std::getenv("UEVR_AFW_DEBUG_VIEW") != nullptr) {
+            vr->afw_debug_view = std::clamp(afw_env_int("UEVR_AFW_DEBUG_VIEW", vr->afw_debug_view),
+                                            0, VR::afw_debug_view_count - 1);
+            SPDLOG_INFO("[VR] AFW debug view initialized from UEVR_AFW_DEBUG_VIEW={} ({})",
+                        vr->afw_debug_view, VR::afw_debug_view_name(vr->afw_debug_view));
+        }
+    }
 
     const auto bb_desc = backbuffer->GetDesc();
     const auto eye_width = static_cast<uint32_t>(bb_desc.Width / 2);
@@ -458,10 +910,16 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     auto eyeFrameBuffer = m_eyeFrameBuffers.eyeFrameBuffers[nEye];
     auto otherEyeFrameBuffer = m_eyeFrameBuffers.eyeFrameBuffers[nEyeOther];
     FrameWarpEvaluateParams params;
-    if ((is_using_afw) && (!eyeFrameBuffer.color.pTexture || !otherEyeFrameBuffer.color.pTexture))
-        force_reset();
 
-    auto colorDesc = eyeFrameBuffer.color.pTexture->GetDesc();
+    const bool frame_warp_ready = is_using_afw && vr->d3d12Renderer != nullptr &&
+                                  eyeFrameBuffer.color.pTexture != nullptr &&
+                                  otherEyeFrameBuffer.color.pTexture != nullptr;
+    if (is_using_afw && !frame_warp_ready) {
+        SPDLOG_ERROR_EVERY_N_SEC(1, "[VR] AFW frame buffers are not ready; skipping frame warp this frame");
+        force_reset();
+    }
+
+    if (frame_warp_ready) {
     static TextureDesc backbufferDesc[6];
     if (backbufferDesc[backbuffer_index].pTexture != backbuffer.Get()) {
         backbufferDesc[backbuffer_index].pTexture = backbuffer.Get();
@@ -475,8 +933,10 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         vr->d3d12Renderer->SetupTextureDesc(realBackbufferDesc[backbuffer_index]);
     }
 
+    ID3D12Resource* uevr_depth_source_for_afw = nullptr;
     if (vr->rawDepthTex) {
         auto desc = vr->rawDepthTex->GetDesc();
+        uevr_depth_source_for_afw = vr->rawDepthTex;
         vr->rawDepthTex = NULL;
         for (int i = 0; i < 2; i++) {
             if (vr->depthDesc[i].pTexture == NULL || vr->depthDesc[i].pTexture->GetDesc().Width != desc.Width ||
@@ -499,12 +959,172 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     }
 
     auto cmdList = vr->d3d12Renderer->BeginCommandList(backbuffer_index);
+    bool afw_uevr_depth_used = false;
+    bool afw_bridge_depth_used = false;
+    bool afw_bridge_velocity_used = false;
+    bool afw_bridge_velocity_combined = false;
+    const bool afw_bridge_enabled = uevr_afw_bridge::enabled();
+    const bool afw_bridge_legacy_fallback = !afw_bridge_enabled || uevr_afw_bridge::legacy_fallback();
+    const auto afw_bridge_velocity_mode_value = afw_bridge_velocity_mode();
+    const bool afw_bridge_use_velocity =
+        afw_bridge_enabled && uevr_afw_bridge::use_velocity() &&
+        afw_bridge_velocity_mode_value != AfwBridgeVelocityMode::Off;
+    const auto afw_eye_color_desc = eyeFrameBuffer.color.pTexture->GetDesc();
+    const uint32_t afw_eye_width = static_cast<uint32_t>(afw_eye_color_desc.Width);
+    const uint32_t afw_eye_height = afw_eye_color_desc.Height;
+
+    if (is_using_afw && uevr_depth_source_for_afw != nullptr && vr->depthDesc[nEye].pTexture != nullptr) {
+        TextureDesc src{};
+        src.type = Depth;
+        src.pTexture = uevr_depth_source_for_afw;
+        src.initialState = ENGINE_SRC_DEPTH;
+        vr->d3d12Renderer->Copy(cmdList, vr->depthDesc[nEye], src);
+        afw_uevr_depth_used = true;
+
+        const auto src_desc = uevr_depth_source_for_afw->GetDesc();
+        SPDLOG_INFO_EVERY_N_SEC(1, "[VR] AFW copied UEVR SceneDepthZ depth ptr={} {}x{} fmt={}",
+                                static_cast<void*>(uevr_depth_source_for_afw), src_desc.Width, src_desc.Height,
+                                static_cast<uint32_t>(src_desc.Format));
+    }
+
+    if (is_using_afw && afw_bridge_enabled) {
+        if (!uevr_afw_bridge::available()) {
+            SPDLOG_WARNING_EVERY_N_SEC(1, "[VR] AFW frame resource bridge is enabled but unavailable: {}",
+                                       uevr_afw_bridge::describe_state());
+        } else {
+            UEVR_FrameResourceView depth_view{};
+            if (uevr_afw_bridge::get_latest_depth(&depth_view) && depth_view.d3d12_resource != nullptr) {
+                const bool depth_is_authoritative_rtpool =
+                    depth_view.provider == UEVR_FRAME_RESOURCE_PROVIDER_RENDER_TARGET_POOL;
+                const bool should_copy_bridge_depth = !afw_uevr_depth_used || depth_is_authoritative_rtpool;
+                if (!should_copy_bridge_depth) {
+                    SPDLOG_INFO_EVERY_N_SEC(2, "[VR] AFW bridge depth provider={} skipped; using UEVR SceneDepthZ depth",
+                                            depth_view.provider);
+                } else {
+                    const auto depth_format = afw_bridge_depth_srv_format(static_cast<DXGI_FORMAT>(depth_view.format));
+                    const auto depth_eye_resource =
+                        afw_bridge_eye_resource(depth_view, afw_eye_width, afw_eye_height, nEye,
+                                                vr->is_stereo_emulation_enabled());
+                    if (afw_bridge_ensure_texture(vr->d3d12Renderer, vr->depthDesc[nEye], depth_eye_resource.view, depth_format,
+                                                  D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, false, "depth")) {
+                        auto src = afw_bridge_source_desc(depth_view, Depth);
+                        if (depth_eye_resource.split_side_by_side) {
+                            afw_copy_texture_region(cmdList, vr->depthDesc[nEye], src, depth_eye_resource.source_box);
+                        } else {
+                            vr->d3d12Renderer->Copy(cmdList, vr->depthDesc[nEye], src);
+                        }
+                        afw_bridge_depth_used = true;
+                        SPDLOG_INFO_EVERY_N_SEC(1, "[VR] AFW bridge copied depth provider={} ptr={} {}x{} fmt={}->{} state=0x{:x} out={}x{} split={}",
+                                                depth_view.provider, depth_view.d3d12_resource, depth_view.width,
+                                                depth_view.height, depth_view.format, static_cast<uint32_t>(depth_format),
+                                                depth_view.expected_state,
+                                                vr->depthDesc[nEye].pTexture != nullptr ? vr->depthDesc[nEye].pTexture->GetDesc().Width : 0,
+                                                vr->depthDesc[nEye].pTexture != nullptr ? vr->depthDesc[nEye].pTexture->GetDesc().Height : 0,
+                                                depth_eye_resource.split_side_by_side ? 1 : 0);
+                    }
+                }
+            } else {
+                SPDLOG_WARNING_EVERY_N_SEC(1, "[VR] AFW bridge depth unavailable: provider={} validity={} reason={}",
+                                           depth_view.provider, depth_view.validity,
+                                           depth_view.reason != nullptr ? depth_view.reason : "");
+            }
+
+            if (afw_bridge_use_velocity) {
+                UEVR_FrameResourceView velocity_view{};
+                if (uevr_afw_bridge::get_latest_velocity(&velocity_view) && velocity_view.d3d12_resource != nullptr) {
+                    if (afw_bridge_velocity_format_allowed(velocity_view.format)) {
+                        const bool raw_velocity_requested =
+                            afw_bridge_velocity_mode_value == AfwBridgeVelocityMode::Raw;
+                        const bool combine_ue_velocity =
+                            afw_bridge_velocity_mode_value == AfwBridgeVelocityMode::Combined &&
+                            vr->depthDesc[nEye].pTexture != nullptr &&
+                            eyeFrameBuffer.color.pTexture != nullptr;
+                        const auto velocity_format = static_cast<DXGI_FORMAT>(velocity_view.format);
+                        bool velocity_ready = false;
+
+                        if (combine_ue_velocity) {
+                            auto output_view = velocity_view;
+                            const auto color_desc = eyeFrameBuffer.color.pTexture->GetDesc();
+                            output_view.width = static_cast<uint32_t>(color_desc.Width);
+                            output_view.height = color_desc.Height;
+                            if (afw_bridge_ensure_texture(vr->d3d12Renderer, vr->motionVectorsDesc[nEye], output_view,
+                                                          DXGI_FORMAT_R16G16_FLOAT,
+                                                          D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, true,
+                                                          "combined velocity")) {
+                                velocity_ready = combine_ue_velocity_for_afw(
+                                    vr, cmdList, velocity_view, vr->depthDesc[nEye], vr->motionVectorsDesc[nEye], nEye,
+                                    vr->afw_force_reconstruct);
+                                afw_bridge_velocity_combined = velocity_ready;
+                                if (!velocity_ready) {
+                                    SPDLOG_WARNING_EVERY_N_SEC(1, "[VR] AFW bridge failed to combine UE velocity; raw velocity fallback={}",
+                                                               afw_env_bool("UEVR_AFW_RAW_VELOCITY_FALLBACK", true) ? 1 : 0);
+                                }
+                            }
+                        }
+
+                        if (!velocity_ready &&
+                            (raw_velocity_requested || afw_env_bool("UEVR_AFW_RAW_VELOCITY_FALLBACK", true))) {
+                            const auto velocity_eye_resource =
+                                afw_bridge_eye_resource(velocity_view, afw_eye_width, afw_eye_height, nEye,
+                                                        vr->is_stereo_emulation_enabled());
+                            if (afw_bridge_ensure_texture(vr->d3d12Renderer, vr->motionVectorsDesc[nEye],
+                                                          velocity_eye_resource.view,
+                                                          velocity_format, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, false,
+                                                          "raw velocity")) {
+                                auto src = afw_bridge_source_desc(velocity_view, Image);
+                                if (velocity_eye_resource.split_side_by_side) {
+                                    afw_copy_texture_region(cmdList, vr->motionVectorsDesc[nEye], src,
+                                                            velocity_eye_resource.source_box);
+                                } else {
+                                    vr->d3d12Renderer->Copy(cmdList, vr->motionVectorsDesc[nEye], src);
+                                }
+                                velocity_ready = true;
+                            }
+                        }
+
+                        if (velocity_ready) {
+                            afw_bridge_velocity_used = true;
+                            vr->mvScale[0] = afw_env_float("UEVR_AFW_VELOCITY_SCALE_X", 1.0f);
+                            vr->mvScale[1] = afw_env_float("UEVR_AFW_VELOCITY_SCALE_Y", 1.0f);
+                            SPDLOG_INFO_EVERY_N_SEC(1, "[VR] AFW bridge {} UE velocity mode={} provider={} ptr={} src={}x{} fmt={} state=0x{:x} out={}x{} mvScale={},{}",
+                                                    afw_bridge_velocity_combined ? "combined" : "copied raw",
+                                                    afw_bridge_velocity_mode_name(afw_bridge_velocity_mode_value),
+                                                    velocity_view.provider, velocity_view.d3d12_resource,
+                                                    velocity_view.width, velocity_view.height, velocity_view.format,
+                                                    velocity_view.expected_state,
+                                                    vr->motionVectorsDesc[nEye].pTexture != nullptr ? vr->motionVectorsDesc[nEye].pTexture->GetDesc().Width : 0,
+                                                    vr->motionVectorsDesc[nEye].pTexture != nullptr ? vr->motionVectorsDesc[nEye].pTexture->GetDesc().Height : 0,
+                                                    vr->mvScale[0], vr->mvScale[1]);
+                        }
+                    } else {
+                        SPDLOG_WARNING_EVERY_N_SEC(1, "[VR] AFW bridge rejected velocity fmt={} provider={} ptr={}; not a UE motion-vector format",
+                                                   velocity_view.format, velocity_view.provider,
+                                                   velocity_view.d3d12_resource);
+                    }
+                } else {
+                    SPDLOG_WARNING_EVERY_N_SEC(1, "[VR] AFW bridge velocity unavailable: provider={} validity={} reason={}",
+                                               velocity_view.provider, velocity_view.validity,
+                                               velocity_view.reason != nullptr ? velocity_view.reason : "");
+                }
+            } else if (afw_bridge_enabled && uevr_afw_bridge::use_velocity() &&
+                       afw_bridge_velocity_mode_value == AfwBridgeVelocityMode::Off) {
+                SPDLOG_INFO_EVERY_N_SEC(5, "[VR] AFW bridge velocity mode=off; not supplying motion vectors");
+            } else {
+                SPDLOG_INFO_EVERY_N_SEC(5, "[VR] AFW bridge velocity consumption disabled; set UEVR_AFW_FRAME_RESOURCES_VELOCITY=1 to opt in");
+            }
+        }
+    }
+
     // if (is_using_afw && is_right_eye_frame) {
     //     FLOAT red[4] = {1, 0, 0, 0};
     //     vr->d3d12Renderer->Clear(cmdList, backbufferDesc[backbuffer_index], red);
     // }
 
-    if (is_using_afw && eyeFrameBuffer.color.pTexture && vr->depthDesc[nEye].pTexture) {
+    const bool afw_has_depth = (afw_bridge_enabled && !afw_bridge_legacy_fallback)
+        ? (afw_bridge_depth_used || afw_uevr_depth_used)
+        : vr->depthDesc[nEye].pTexture != nullptr;
+
+    if (is_using_afw && eyeFrameBuffer.color.pTexture && afw_has_depth) {
         static FrameBufferDesc s_CurrentEyeFrameBuffer{};
 
         D3D12_BOX src_box{.left = 0,
@@ -514,7 +1134,42 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             .bottom = m_backbuffer_size[1],
             .back = 1};
 
-        vr->d3d12Renderer->Crop(cmdList, eyeFrameBuffer.color, backbufferDesc[backbuffer_index], src_box);
+        const auto afw_color_dst_desc = eyeFrameBuffer.color.pTexture->GetDesc();
+        const bool afw_full_source_viewport = afw_env_bool("UEVR_AFW_FULL_SOURCE_VIEWPORT", false);
+        const D3D12_VIEWPORT afw_source_viewport{
+            .TopLeftX = 0.0f,
+            .TopLeftY = 0.0f,
+            .Width = static_cast<float>(afw_color_dst_desc.Width),
+            .Height = static_cast<float>(afw_color_dst_desc.Height),
+            .MinDepth = 0.0f,
+            .MaxDepth = 1.0f};
+        const bool afw_projection_override_active =
+            vr->get_horizontal_projection_override() != VR::HORIZONTAL_PROJECTION_OVERRIDE::HORIZONTAL_DEFAULT ||
+            vr->get_vertical_projection_override() != VR::VERTICAL_PROJECTION_OVERRIDE::VERTICAL_DEFAULT;
+
+        if (afw_projection_override_active) {
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] AFW guard-band source feed: src {}x{} -> PDAFW {}x{} full_viewport={} bounds L({}, {}, {}, {}) R({}, {}, {}, {})",
+                                    src_box.right - src_box.left, src_box.bottom - src_box.top,
+                                    afw_color_dst_desc.Width, afw_color_dst_desc.Height,
+                                    afw_full_source_viewport ? 1 : 0,
+                                    runtime->view_bounds[0][0], runtime->view_bounds[0][1],
+                                    runtime->view_bounds[0][2], runtime->view_bounds[0][3],
+                                    runtime->view_bounds[1][0], runtime->view_bounds[1][1],
+                                    runtime->view_bounds[1][2], runtime->view_bounds[1][3]);
+        }
+
+        if (afw_full_source_viewport) {
+            vr->d3d12Renderer->Crop(cmdList, eyeFrameBuffer.color, backbufferDesc[backbuffer_index], src_box, afw_source_viewport);
+        } else {
+            vr->d3d12Renderer->Crop(cmdList, eyeFrameBuffer.color, backbufferDesc[backbuffer_index], src_box);
+        }
+
+        const bool afw_prefill_warp_output = afw_env_bool("UEVR_AFW_PREFILL_WARP_OUTPUT", true);
+        if (afw_prefill_warp_output && otherEyeFrameBuffer.color.pTexture != nullptr) {
+            vr->d3d12Renderer->Copy(cmdList, otherEyeFrameBuffer.color, eyeFrameBuffer.color);
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] AFW prefilled warp output from native eye before EvaluateFrameWarp");
+        }
+
         FLOAT black[4] = {0, 0, 0, 0};
         //if (vr->mDebug1) {
         //    vr->d3d12Renderer->Clear(cmdList, vr->motionVectorsDesc[nEye], black);
@@ -522,7 +1177,8 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
         s_CurrentEyeFrameBuffer.color = eyeFrameBuffer.color;
         s_CurrentEyeFrameBuffer.depth = vr->depthDesc[nEye];
-        s_CurrentEyeFrameBuffer.motionVectors = vr->motionVectorsDesc[nEye];
+        s_CurrentEyeFrameBuffer.motionVectors =
+            (afw_bridge_velocity_used || afw_bridge_legacy_fallback) ? vr->motionVectorsDesc[nEye] : TextureDesc{};
         //if (vr->mDebug2) {
         //    vr->d3d12Renderer->Clear(cmdList, eyeFrameBuffer.depth, black);
         //    s_CurrentEyeFrameBuffer.depth = eyeFrameBuffer.depth;
@@ -532,15 +1188,21 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         params.InEyeFrameBuffer = &s_CurrentEyeFrameBuffer;
         params.InUIColorAlpha = NULL;
         params.IsHudlessColor = true;
-        params.MotionVectorsType = vr->is_fix_dlss() ? Normal : FromOtherEye;
         params.InMotionScale[0] = vr->mvScale[0];
         params.InMotionScale[1] = vr->mvScale[1];
         params.Mode = (FrameWarpMode)vr->m_framewarp_mode->value();
+        params.MotionVectorsType =
+            afw_select_motion_vectors_type(params.Mode, afw_bridge_velocity_used, afw_bridge_velocity_combined, vr->is_fix_dlss());
         params.EyeIndex = nEye;
         params.ClearBeforeWarping = vr->m_clear_before_framewarp->value();
         params.CameraData = &vr->cameraData[nEye];
         params.IgnoreMotionThreshold = vr->m_ignore_motion_threshold->value();
         params.Debug = vr->m_framewarp_debug->value();
+        SPDLOG_INFO_EVERY_N_SEC(2, "[VR] AFW params mode={} mvType={} bridgeVelocity={} mvScale={},{}",
+                                static_cast<int>(params.Mode),
+                                afw_motion_vectors_type_name(params.MotionVectorsType),
+                                afw_bridge_velocity_used ? 1 : 0, params.InMotionScale[0],
+                                params.InMotionScale[1]);
 
         if (vr->m_enable_ui_fix->value() && vr->uiBufferDesc.pTexture) {
             params.InUIColorAlpha = &vr->uiBufferDesc;
@@ -553,12 +1215,23 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         //}
         EvaluateFrameWarp(params);
 
+        // Cycle-able debug buffer visualizer (Ctrl+Shift+V): overwrite the eyes with a false-color
+        // view of motion vectors / depth / raw velocity so they can be inspected directly in-headset.
+        if (vr->afw_debug_view != 0) {
+            // Pin to eye 0 so the view doesn't flicker as AFW alternates the natively-rendered eye.
+            render_debug_view(vr, cmdList, vr->afw_debug_view, static_cast<EyeIndex>(0),
+                              backbufferDesc[backbuffer_index], &otherEyeFrameBuffer.color);
+        }
+
         D3D12_VIEWPORT vp{
             .TopLeftX = 0, .TopLeftY = 0, .Width = (float)src_box.right, .Height = (float)src_box.bottom, .MinDepth = 0, .MaxDepth = 1};
         // vr->d3d12Renderer->Blit(cmdList, backbufferDesc[backbuffer_index], otherEyeFrameBuffer.color, vp);
+    } else if (is_using_afw && afw_bridge_enabled && !afw_bridge_legacy_fallback) {
+        SPDLOG_WARNING_EVERY_N_SEC(1, "[VR] AFW bridge skipped EvaluateFrameWarp because bridged depth is not ready");
     }
 
     vr->d3d12Renderer->EndCommandList(backbuffer_index);
+    }
 
     // #############################
     // #Frame Warp Module End
@@ -590,7 +1263,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             }
 
             if (is_using_afw) {
-                m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_RIGHT_EYE, otherEyeFrameBuffer.color.pTexture, D3D12_RESOURCE_STATE_RENDER_TARGET, &src_box);
+                m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_RIGHT_EYE, otherEyeFrameBuffer.color.pTexture, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
                 //if (scene_depth_tex != nullptr) {
                 //    m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_DEPTH_RIGHT_EYE, otherEyeFrameBuffer.depth.pTexture,
                 //    ENGINE_SRC_DEPTH, nullptr);
@@ -705,18 +1378,77 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 }
 
                 if (is_using_afw) {
-                    D3D12_BOX src_box2{.left = 0,
-                        .top = 0,
-                        .front = 0,
-                        .right = vr->is_extreme_compatibility_mode_enabled() ? m_backbuffer_size[0] : m_backbuffer_size[0] / 2,
-                        .bottom = m_backbuffer_size[1],
-                        .back = 1};
-                    m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_LEFT_EYE, otherEyeFrameBuffer.color.pTexture, D3D12_RESOURCE_STATE_RENDER_TARGET, &src_box2);
+                    m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_LEFT_EYE, otherEyeFrameBuffer.color.pTexture, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
                 }
             } else {
                 // Copy over the entire double wide instead
                 if (m_scene_capture_tex.texture.Get() == nullptr) {
-                    m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE, backbuffer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
+                    const auto copy_or_duplicate_backbuffer =
+                        [this, vr, backbuffer](d3d12::CommandContext& commands, ID3D12Resource* render_target) {
+                            if (backbuffer.Get() == nullptr || render_target == nullptr) {
+                                return;
+                            }
+
+                            const auto src_desc = backbuffer->GetDesc();
+                            const auto dst_desc = render_target->GetDesc();
+
+                            const auto draw_debug_to_target = [&]() {
+                                if (vr->afw_debug_view == 0) {
+                                    return;
+                                }
+
+                                if (vr->d3d12Renderer == nullptr) {
+                                    SPDLOG_WARNING_EVERY_N_SEC(2, "[VR] OpenXR frame-resource debug view requested but PDAFW D3D12 renderer is unavailable");
+                                    return;
+                                }
+
+                                TextureDesc debug_target{};
+                                debug_target.pTexture = render_target;
+                                debug_target.initialState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                                vr->d3d12Renderer->SetupTextureDesc(debug_target);
+                                render_frame_resource_debug_view(vr, commands.cmd_list.Get(), vr->afw_debug_view,
+                                                                 debug_target, nullptr);
+                            };
+
+                            if (src_desc.Width == dst_desc.Width && src_desc.Height == dst_desc.Height) {
+                                commands.copy(backbuffer.Get(), render_target, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                              D3D12_RESOURCE_STATE_RENDER_TARGET);
+                                draw_debug_to_target();
+                                return;
+                            }
+
+                            const uint32_t eye_width = static_cast<uint32_t>(dst_desc.Width / 2u);
+                            if (eye_width == 0 || dst_desc.Height == 0) {
+                                return;
+                            }
+
+                            const uint32_t copy_width = static_cast<uint32_t>(std::min<uint64_t>(src_desc.Width, eye_width));
+                            const uint32_t copy_height = std::min(src_desc.Height, dst_desc.Height);
+                            if (copy_width == 0 || copy_height == 0) {
+                                return;
+                            }
+
+                            D3D12_BOX src_box{};
+                            src_box.left = 0;
+                            src_box.top = 0;
+                            src_box.front = 0;
+                            src_box.right = copy_width;
+                            src_box.bottom = copy_height;
+                            src_box.back = 1;
+
+                            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] OpenXR stereo-emulation fallback copying {}x{} source into double-wide {}x{} eye halves",
+                                                    src_desc.Width, src_desc.Height, dst_desc.Width, dst_desc.Height);
+                            commands.copy_region(backbuffer.Get(), render_target, &src_box, 0, 0, 0,
+                                                 D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                 D3D12_RESOURCE_STATE_RENDER_TARGET);
+                            commands.copy_region(backbuffer.Get(), render_target, &src_box, eye_width, 0, 0,
+                                                 D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                 D3D12_RESOURCE_STATE_RENDER_TARGET);
+                            draw_debug_to_target();
+                        };
+                    m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE, nullptr,
+                                  copy_or_duplicate_backbuffer, std::nullopt,
+                                  D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
                 } else {
                     m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE, nullptr, pre_render, std::nullopt, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
                 }
@@ -922,6 +1654,638 @@ std::unique_ptr<DirectX::DX12::SpriteBatch> D3D12Component::setup_sprite_batch_p
     spdlog::info("[D3D12] Sprite batch PSO setup complete");
 
     return batch;
+}
+
+bool D3D12Component::setup_velocity_combine_pipeline(ID3D12Device* device) {
+    if (device == nullptr) {
+        return false;
+    }
+
+    if (m_velocity_combine_root_signature != nullptr && m_velocity_combine_pso != nullptr) {
+        return true;
+    }
+
+    D3D12_DESCRIPTOR_RANGE velocity_srv_range{};
+    velocity_srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    velocity_srv_range.NumDescriptors = 1;
+    velocity_srv_range.BaseShaderRegister = 0;
+    velocity_srv_range.RegisterSpace = 0;
+    velocity_srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_DESCRIPTOR_RANGE depth_srv_range{};
+    depth_srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    depth_srv_range.NumDescriptors = 1;
+    depth_srv_range.BaseShaderRegister = 1;
+    depth_srv_range.RegisterSpace = 0;
+    depth_srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_DESCRIPTOR_RANGE output_uav_range{};
+    output_uav_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    output_uav_range.NumDescriptors = 1;
+    output_uav_range.BaseShaderRegister = 0;
+    output_uav_range.RegisterSpace = 0;
+    output_uav_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_ROOT_PARAMETER root_parameters[4]{};
+    root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    root_parameters[0].DescriptorTable.NumDescriptorRanges = 1;
+    root_parameters[0].DescriptorTable.pDescriptorRanges = &velocity_srv_range;
+    root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    root_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    root_parameters[1].DescriptorTable.NumDescriptorRanges = 1;
+    root_parameters[1].DescriptorTable.pDescriptorRanges = &depth_srv_range;
+    root_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    root_parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    root_parameters[2].DescriptorTable.NumDescriptorRanges = 1;
+    root_parameters[2].DescriptorTable.pDescriptorRanges = &output_uav_range;
+    root_parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    root_parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    root_parameters[3].Constants.ShaderRegister = 0;
+    root_parameters[3].Constants.RegisterSpace = 0;
+    root_parameters[3].Constants.Num32BitValues = sizeof(AFWVelocityCombineConstants) / sizeof(uint32_t);
+    root_parameters[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC root_signature_desc{};
+    root_signature_desc.NumParameters = sizeof(root_parameters) / sizeof(root_parameters[0]);
+    root_signature_desc.pParameters = root_parameters;
+    root_signature_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+    ComPtr<ID3DBlob> signature_blob{};
+    ComPtr<ID3DBlob> error_blob{};
+    if (FAILED(D3D12SerializeRootSignature(
+            &root_signature_desc, D3D_ROOT_SIGNATURE_VERSION_1, &signature_blob, &error_blob))) {
+        const char* error = error_blob != nullptr ? static_cast<const char*>(error_blob->GetBufferPointer()) : "";
+        SPDLOG_ERROR("[VR] Failed to serialize AFW UE velocity combine root signature: {}", error);
+        return false;
+    }
+
+    if (FAILED(device->CreateRootSignature(
+            0, signature_blob->GetBufferPointer(), signature_blob->GetBufferSize(),
+            IID_PPV_ARGS(&m_velocity_combine_root_signature)))) {
+        SPDLOG_ERROR("[VR] Failed to create AFW UE velocity combine root signature");
+        return false;
+    }
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
+    pso_desc.pRootSignature = m_velocity_combine_root_signature.Get();
+    pso_desc.CS = D3D12_SHADER_BYTECODE{
+        ue_velocity_combine_cs_VelocityCombineCS,
+        sizeof(ue_velocity_combine_cs_VelocityCombineCS)};
+
+    if (FAILED(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&m_velocity_combine_pso)))) {
+        SPDLOG_ERROR("[VR] Failed to create AFW UE velocity combine PSO");
+        m_velocity_combine_root_signature.Reset();
+        return false;
+    }
+
+    spdlog::info("[VR] AFW UE velocity combine pipeline setup complete");
+    return true;
+}
+
+bool D3D12Component::combine_ue_velocity_for_afw(
+    VR* vr,
+    ID3D12GraphicsCommandList* command_list,
+    const UEVR_FrameResourceView& velocity_view,
+    TextureDesc& depth_desc,
+    TextureDesc& output_desc,
+    EyeIndex eye,
+    bool force_reconstruct) {
+    if (vr == nullptr || vr->d3d12Renderer == nullptr || command_list == nullptr ||
+        velocity_view.d3d12_resource == nullptr || depth_desc.pTexture == nullptr ||
+        output_desc.pTexture == nullptr) {
+        return false;
+    }
+
+    auto device = g_framework->get_d3d12_hook()->get_device();
+    if (!setup_velocity_combine_pipeline(device)) {
+        return false;
+    }
+
+    // Debug: one-shot readback of the (previous frame's) combined velocity for offline false-coloring.
+    if (afw_env_bool("UEVR_AFW_DUMP_COMBINED_VELOCITY", false)) {
+        static int s_combine_calls = 0;
+        static bool s_dumped = false;
+        ++s_combine_calls;
+        if (!s_dumped && s_combine_calls >= 120 && output_desc.pTexture != nullptr) {
+            afw_dump_texture_to_disk(device, g_framework->get_d3d12_hook()->get_command_queue(),
+                                     output_desc.pTexture, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
+                                     "E:\\Github\\UEVRPureDark\\afw_work\\combined_velocity.bin");
+            s_dumped = true;
+            SPDLOG_INFO("[VR] AFW dumped combined velocity to afw_work/combined_velocity.bin ({}x{})",
+                        static_cast<uint32_t>(output_desc.pTexture->GetDesc().Width),
+                        output_desc.pTexture->GetDesc().Height);
+        }
+    }
+
+    auto& raw_velocity_desc = m_raw_velocity_desc[eye];
+    if (raw_velocity_desc.pTexture != velocity_view.d3d12_resource ||
+        raw_velocity_desc.initialState != static_cast<D3D12_RESOURCE_STATES>(velocity_view.expected_state) ||
+        raw_velocity_desc.shaderResourceViewHandle.ptr == 0) {
+        raw_velocity_desc = afw_bridge_source_desc(velocity_view, Image);
+        vr->d3d12Renderer->SetupTextureDesc(raw_velocity_desc);
+    }
+
+    // Diagnostic: capture the bridged raw velocity INLINE on this command list (where its content is
+    // valid) into a stable texture, then read it back. Reveals whether the combine is decoding real
+    // velocity or a transient/aliased buffer. Gated + dump-once. Stable tex stays in COPY_DEST.
+    if (afw_env_bool("UEVR_AFW_DUMP_RAW_VELOCITY", false) && raw_velocity_desc.pTexture != nullptr) {
+        const auto rv_desc = raw_velocity_desc.pTexture->GetDesc();
+        if (m_raw_velocity_stable.pTexture == nullptr ||
+            m_raw_velocity_stable.pTexture->GetDesc().Width != rv_desc.Width ||
+            m_raw_velocity_stable.pTexture->GetDesc().Height != rv_desc.Height) {
+            vr->d3d12Renderer->CreateTexture(static_cast<int>(rv_desc.Width), rv_desc.Height, rv_desc.Format,
+                                             D3D12_RESOURCE_STATE_COPY_DEST, m_raw_velocity_stable, false);
+        }
+        if (m_raw_velocity_stable.pTexture != nullptr) {
+            // Inline copy every frame so the stable texture always holds the latest VALID velocity.
+            auto src_state = raw_velocity_desc.initialState;
+            if (src_state == D3D12_RESOURCE_STATE_COMMON) src_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            afw_transition_resource(command_list, raw_velocity_desc.pTexture, src_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            command_list->CopyResource(m_raw_velocity_stable.pTexture, raw_velocity_desc.pTexture);
+            afw_transition_resource(command_list, raw_velocity_desc.pTexture, D3D12_RESOURCE_STATE_COPY_SOURCE, src_state);
+            // Dump on request (Ctrl+Shift+D). The copy above is on this (not-yet-submitted) command list,
+            // so dump the stable tex which holds the PREVIOUS frame's already-executed copy — a valid
+            // motion frame if the camera is moving when requested.
+            if (vr->afw_dump_raw_velocity_request) {
+                afw_dump_texture_to_disk(device, g_framework->get_d3d12_hook()->get_command_queue(),
+                                         m_raw_velocity_stable.pTexture, D3D12_RESOURCE_STATE_COPY_DEST,
+                                         "E:\\Github\\UEVRPureDark\\afw_work\\raw_velocity.bin");
+                vr->afw_dump_raw_velocity_request = false;
+                SPDLOG_INFO("[VR] AFW dumped RAW velocity to afw_work/raw_velocity.bin ({}x{} fmt={})",
+                            static_cast<uint32_t>(rv_desc.Width), rv_desc.Height,
+                            static_cast<uint32_t>(rv_desc.Format));
+            }
+        }
+    }
+
+    if (output_desc.unorderedAccessViewHandle.ptr == 0 || output_desc.uavPos < 0) {
+        const int uav_pos = vr->d3d12Renderer->CreateUAV(output_desc.pTexture);
+        if (uav_pos < 0) {
+            SPDLOG_ERROR_EVERY_N_SEC(1, "[VR] AFW UE velocity combine failed to create output UAV");
+            return false;
+        }
+        output_desc.uavPos = uav_pos;
+        output_desc.unorderedAccessViewHandle = vr->d3d12Renderer->GetGPUDescriptorHandle(uav_pos);
+    }
+
+    if (raw_velocity_desc.shaderResourceViewHandle.ptr == 0 ||
+        depth_desc.shaderResourceViewHandle.ptr == 0 ||
+        output_desc.unorderedAccessViewHandle.ptr == 0) {
+        SPDLOG_ERROR_EVERY_N_SEC(1, "[VR] AFW UE velocity combine missing descriptors velocity={} depth={} output={}",
+                                 raw_velocity_desc.shaderResourceViewHandle.ptr,
+                                 depth_desc.shaderResourceViewHandle.ptr,
+                                 output_desc.unorderedAccessViewHandle.ptr);
+        return false;
+    }
+
+    const auto output_resource_desc = output_desc.pTexture->GetDesc();
+    const auto depth_resource_desc = depth_desc.pTexture->GetDesc();
+
+    const auto& camera_data = vr->cameraData[eye];
+    glm::mat4 clip_to_prev_clip{};
+
+    if (afw_env_bool("UEVR_AFW_COMBINE_USE_AFW_TARGET", false)) {
+        clip_to_prev_clip =
+            camera_data.destViewToClipMatrix *
+            camera_data.destWorldToViewMatrix *
+            camera_data.srcViewToWorldMatrix *
+            camera_data.srcClipToViewMatrix;
+    } else {
+        // The engine history slot (render_view_matrix[eye][1]) is empty in the AFW path, which
+        // collapsed ClipToPrevClip to identity (zero camera motion). Cache the previous frame's
+        // world->view and view->clip per eye ourselves so the temporal reprojection is real.
+        static glm::mat4 s_prev_w2v[2]{};
+        static glm::mat4 s_prev_v2c[2]{};
+        static bool s_prev_valid[2]{false, false};
+        const int ei = (eye == static_cast<EyeIndex>(1)) ? 1 : 0;
+
+        glm::mat4 prev_world_to_view = s_prev_valid[ei] ? s_prev_w2v[ei] : camera_data.srcWorldToViewMatrix;
+        glm::mat4 prev_view_to_clip = s_prev_valid[ei] ? s_prev_v2c[ei] : camera_data.srcViewToClipMatrix;
+
+        clip_to_prev_clip =
+            prev_view_to_clip *
+            prev_world_to_view *
+            camera_data.srcViewToWorldMatrix *
+            camera_data.srcClipToViewMatrix;
+
+        s_prev_w2v[ei] = camera_data.srcWorldToViewMatrix;
+        s_prev_v2c[ei] = camera_data.srcViewToClipMatrix;
+        s_prev_valid[ei] = true;
+    }
+
+    // UE matrices vs glm/HLSL column-major can disagree on handedness; allow a live transpose
+    // toggle (Ctrl+Shift+T) to confirm the correct convention without rebuilding.
+    if (vr->afw_combine_transpose) {
+        clip_to_prev_clip = glm::transpose(clip_to_prev_clip);
+    }
+
+    AFWVelocityCombineConstants constants{};
+    std::memcpy(constants.clip_to_prev_clip, &clip_to_prev_clip[0][0], sizeof(constants.clip_to_prev_clip));
+    constants.output_size[0] = static_cast<uint32_t>(output_resource_desc.Width);
+    constants.output_size[1] = output_resource_desc.Height;
+    constants.inv_output_size[0] = constants.output_size[0] > 0 ? 1.0f / static_cast<float>(constants.output_size[0]) : 0.0f;
+    constants.inv_output_size[1] = constants.output_size[1] > 0 ? 1.0f / static_cast<float>(constants.output_size[1]) : 0.0f;
+    constants.velocity_size[0] = velocity_view.width;
+    constants.velocity_size[1] = velocity_view.height;
+    constants.depth_size[0] = static_cast<uint32_t>(depth_resource_desc.Width);
+    constants.depth_size[1] = depth_resource_desc.Height;
+    constants.velocity_extent[0] = constants.velocity_size[0];
+    constants.velocity_extent[1] = constants.velocity_size[1];
+    constants.depth_extent[0] = constants.depth_size[0];
+    constants.depth_extent[1] = constants.depth_size[1];
+    constants.force_reconstruct = force_reconstruct ? 1u : 0u;
+
+    if (constants.output_size[0] == 0 || constants.output_size[1] == 0 ||
+        constants.velocity_size[0] == 0 || constants.velocity_size[1] == 0 ||
+        constants.depth_size[0] == 0 || constants.depth_size[1] == 0) {
+        return false;
+    }
+
+    auto configure_stereo_region = [vr, eye](const uint32_t size[2], uint32_t origin[2], uint32_t extent[2],
+                                             const uint32_t output_size[2], const char* label) {
+        if (size[0] == output_size[0] * 2u && size[1] == output_size[1]) {
+            origin[0] = eye == EyeRight ? output_size[0] : 0u;
+            extent[0] = output_size[0];
+            extent[1] = output_size[1];
+            return;
+        }
+
+        const bool looks_like_stereo_source =
+            vr != nullptr && vr->is_stereo_emulation_enabled() &&
+            size[0] >= 2u && (size[0] % 2u) == 0u &&
+            size[1] > 0u && size[0] >= size[1] * 2u;
+        if (looks_like_stereo_source) {
+            const uint32_t source_eye_width = size[0] / 2u;
+            origin[0] = eye == EyeRight ? source_eye_width : 0u;
+            extent[0] = source_eye_width;
+            extent[1] = size[1];
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] AFW UE velocity combine sampling {} side-by-side source {}x{} as eye region x={} w={} h={} -> output {}x{}",
+                                    label, size[0], size[1], origin[0], extent[0], extent[1],
+                                    output_size[0], output_size[1]);
+        }
+    };
+
+    configure_stereo_region(constants.velocity_size, constants.velocity_origin, constants.velocity_extent,
+                            constants.output_size, "velocity");
+    configure_stereo_region(constants.depth_size, constants.depth_origin, constants.depth_extent,
+                            constants.output_size, "depth");
+
+    ID3D12DescriptorHeap* heaps[] = { vr->d3d12Renderer->GetViewHeap() };
+    command_list->SetDescriptorHeaps(1, heaps);
+    command_list->SetComputeRootSignature(m_velocity_combine_root_signature.Get());
+    command_list->SetPipelineState(m_velocity_combine_pso.Get());
+    command_list->SetComputeRootDescriptorTable(0, raw_velocity_desc.shaderResourceViewHandle);
+    command_list->SetComputeRootDescriptorTable(1, depth_desc.shaderResourceViewHandle);
+    command_list->SetComputeRootDescriptorTable(2, output_desc.unorderedAccessViewHandle);
+    command_list->SetComputeRoot32BitConstants(
+        3, sizeof(AFWVelocityCombineConstants) / sizeof(uint32_t), &constants, 0);
+
+    auto velocity_state = raw_velocity_desc.initialState;
+    if (velocity_state == D3D12_RESOURCE_STATE_COMMON) {
+        velocity_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    }
+    const bool transition_velocity = (velocity_state & D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) == 0;
+    if (transition_velocity) {
+        afw_transition_resource(command_list, raw_velocity_desc.pTexture, velocity_state,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    afw_transition_resource(command_list, output_desc.pTexture, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    command_list->Dispatch((constants.output_size[0] + 7) / 8, (constants.output_size[1] + 7) / 8, 1);
+
+    afw_uav_barrier(command_list, output_desc.pTexture);
+    afw_transition_resource(command_list, output_desc.pTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+    if (transition_velocity) {
+        afw_transition_resource(command_list, raw_velocity_desc.pTexture,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, velocity_state);
+    }
+
+    return true;
+}
+
+bool D3D12Component::prepare_frame_resource_combined_motion_vectors(
+    VR* vr,
+    ID3D12GraphicsCommandList* command_list,
+    EyeIndex eye,
+    TextureDesc& output_dst,
+    bool force_reconstruct) {
+    if (vr == nullptr || vr->d3d12Renderer == nullptr || command_list == nullptr ||
+        output_dst.pTexture == nullptr) {
+        return false;
+    }
+
+    if (!uevr_afw_bridge::enabled() || !uevr_afw_bridge::available()) {
+        SPDLOG_WARNING_EVERY_N_SEC(2, "[VR] Combined debug motion vectors unavailable: {}",
+                                   uevr_afw_bridge::describe_state());
+        return false;
+    }
+
+    UEVR_FrameResourceView depth_view{};
+    if (!uevr_afw_bridge::get_latest_depth(&depth_view) || depth_view.d3d12_resource == nullptr) {
+        SPDLOG_WARNING_EVERY_N_SEC(2, "[VR] Combined debug motion vectors missing depth: provider={} validity={} reason={}",
+                                   depth_view.provider, depth_view.validity,
+                                   depth_view.reason != nullptr ? depth_view.reason : "");
+        return false;
+    }
+
+    UEVR_FrameResourceView velocity_view{};
+    if (!uevr_afw_bridge::get_latest_velocity(&velocity_view) || velocity_view.d3d12_resource == nullptr) {
+        SPDLOG_WARNING_EVERY_N_SEC(2, "[VR] Combined debug motion vectors missing velocity: provider={} validity={} reason={}",
+                                   velocity_view.provider, velocity_view.validity,
+                                   velocity_view.reason != nullptr ? velocity_view.reason : "");
+        return false;
+    }
+
+    if (!afw_bridge_velocity_format_allowed(velocity_view.format)) {
+        SPDLOG_WARNING_EVERY_N_SEC(2, "[VR] Combined debug motion vectors rejected velocity fmt={} provider={} ptr={}",
+                                   velocity_view.format, velocity_view.provider, velocity_view.d3d12_resource);
+        return false;
+    }
+
+    const auto dst_desc = output_dst.pTexture->GetDesc();
+    const uint32_t out_w = static_cast<uint32_t>(dst_desc.Width);
+    const uint32_t out_h = dst_desc.Height;
+    if (out_w == 0 || out_h == 0) {
+        return false;
+    }
+
+    const auto depth_format = afw_bridge_depth_srv_format(static_cast<DXGI_FORMAT>(depth_view.format));
+    if (!afw_bridge_ensure_texture(vr->d3d12Renderer, vr->depthDesc[eye], depth_view, depth_format,
+                                   D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, false, "debug combined depth")) {
+        return false;
+    }
+
+    auto depth_src = afw_bridge_source_desc(depth_view, Depth);
+    const D3D12_BOX depth_box{0, 0, 0, depth_view.width, depth_view.height, 1};
+    afw_copy_texture_region(command_list, vr->depthDesc[eye], depth_src, depth_box);
+
+    auto output_view = velocity_view;
+    output_view.width = out_w;
+    output_view.height = out_h;
+    if (!afw_bridge_ensure_texture(vr->d3d12Renderer, m_combined_debug_velocity_desc[eye], output_view,
+                                   DXGI_FORMAT_R16G16_FLOAT,
+                                   D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, true,
+                                   "debug combined velocity")) {
+        return false;
+    }
+
+    const bool combined = combine_ue_velocity_for_afw(
+        vr, command_list, velocity_view, vr->depthDesc[eye], m_combined_debug_velocity_desc[eye], eye,
+        force_reconstruct);
+    if (combined) {
+        SPDLOG_INFO_EVERY_N_SEC(2, "[VR] OpenXR frame-resource debug view prepared combined/dense motion vectors velocity={}x{} depth={}x{} out={}x{} forceReconstruct={}",
+                                velocity_view.width, velocity_view.height,
+                                depth_view.width, depth_view.height,
+                                out_w, out_h,
+                                force_reconstruct ? 1 : 0);
+    }
+
+    return combined;
+}
+
+bool D3D12Component::setup_debug_view_pipeline(ID3D12Device* device) {
+    if (device == nullptr) {
+        return false;
+    }
+    if (m_debug_view_root_signature != nullptr && m_debug_view_pso != nullptr) {
+        return true;
+    }
+
+    D3D12_DESCRIPTOR_RANGE srv_range{};
+    srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; srv_range.NumDescriptors = 1; srv_range.BaseShaderRegister = 0;
+    srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    D3D12_DESCRIPTOR_RANGE uav_range{};
+    uav_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; uav_range.NumDescriptors = 1; uav_range.BaseShaderRegister = 0;
+    uav_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_ROOT_PARAMETER rp[3]{};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; rp[0].DescriptorTable.NumDescriptorRanges = 1;
+    rp[0].DescriptorTable.pDescriptorRanges = &srv_range; rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; rp[1].DescriptorTable.NumDescriptorRanges = 1;
+    rp[1].DescriptorTable.pDescriptorRanges = &uav_range; rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; rp[2].Constants.ShaderRegister = 0;
+    rp[2].Constants.Num32BitValues = sizeof(AFWDebugVizConstants) / sizeof(uint32_t); rp[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC rsd{}; rsd.NumParameters = 3; rsd.pParameters = rp; rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+    ComPtr<ID3DBlob> sig, err;
+    if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err))) {
+        SPDLOG_ERROR("[VR] Failed to serialize AFW debug-view root signature: {}",
+                     err != nullptr ? static_cast<const char*>(err->GetBufferPointer()) : "");
+        return false;
+    }
+    if (FAILED(device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
+                                           IID_PPV_ARGS(&m_debug_view_root_signature)))) {
+        return false;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
+    pso.pRootSignature = m_debug_view_root_signature.Get();
+    pso.CS = D3D12_SHADER_BYTECODE{afw_debug_visualize_cs_DebugVisualizeCS, sizeof(afw_debug_visualize_cs_DebugVisualizeCS)};
+    if (FAILED(device->CreateComputePipelineState(&pso, IID_PPV_ARGS(&m_debug_view_pso)))) {
+        m_debug_view_root_signature.Reset();
+        return false;
+    }
+    spdlog::info("[VR] AFW debug-view pipeline setup complete");
+    return true;
+}
+
+bool D3D12Component::render_frame_resource_debug_view(VR* vr, ID3D12GraphicsCommandList* command_list, int view_mode,
+                                                      TextureDesc& backbuffer_dst, TextureDesc* other_eye_dst) {
+    if (vr == nullptr || vr->d3d12Renderer == nullptr || command_list == nullptr || view_mode <= 0) {
+        return false;
+    }
+
+    if (!uevr_afw_bridge::enabled() || !uevr_afw_bridge::available()) {
+        SPDLOG_WARNING_EVERY_N_SEC(2, "[VR] Frame-resource debug view unavailable: {}",
+                                   uevr_afw_bridge::describe_state());
+        return false;
+    }
+
+    constexpr EyeIndex debug_eye = EyeLeft;
+
+    if (view_mode >= 1 && view_mode <= 3) {
+        const bool have_existing_motion_vectors =
+            m_combined_debug_velocity_desc[debug_eye].pTexture != nullptr &&
+            m_combined_debug_velocity_desc[debug_eye].shaderResourceViewHandle.ptr != 0;
+        const bool force_reconstruct = view_mode == 3 || vr->afw_force_reconstruct;
+        const bool have_combined_motion_vectors =
+            prepare_frame_resource_combined_motion_vectors(vr, command_list, debug_eye, backbuffer_dst,
+                                                           force_reconstruct);
+        if (!have_combined_motion_vectors && !have_existing_motion_vectors) {
+            SPDLOG_WARNING_EVERY_N_SEC(2, "[VR] Combined/dense debug motion vectors unavailable");
+            return false;
+        }
+        SPDLOG_INFO_EVERY_N_SEC(2, "[VR] OpenXR frame-resource debug view drawing {}{}",
+                                VR::afw_debug_view_name(view_mode),
+                                have_combined_motion_vectors ? "" : " (existing texture)");
+        render_debug_view(vr, command_list, view_mode, debug_eye, backbuffer_dst, other_eye_dst);
+        return true;
+    }
+
+    if (view_mode == 4) {
+        UEVR_FrameResourceView depth_view{};
+        if (!uevr_afw_bridge::get_latest_depth(&depth_view) || depth_view.d3d12_resource == nullptr) {
+            SPDLOG_WARNING_EVERY_N_SEC(2, "[VR] Frame-resource debug depth unavailable: provider={} validity={} reason={}",
+                                       depth_view.provider, depth_view.validity,
+                                       depth_view.reason != nullptr ? depth_view.reason : "");
+            return false;
+        }
+
+        const auto depth_format = afw_bridge_depth_srv_format(static_cast<DXGI_FORMAT>(depth_view.format));
+        if (!afw_bridge_ensure_texture(vr->d3d12Renderer, vr->depthDesc[debug_eye], depth_view, depth_format,
+                                       D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, false, "debug depth")) {
+            return false;
+        }
+
+        auto src = afw_bridge_source_desc(depth_view, Depth);
+        const D3D12_BOX source_box{0, 0, 0, depth_view.width, depth_view.height, 1};
+        afw_copy_texture_region(command_list, vr->depthDesc[debug_eye], src, source_box);
+        SPDLOG_INFO_EVERY_N_SEC(2, "[VR] OpenXR frame-resource debug view drawing depth provider={} ptr={} {}x{} fmt={}",
+                                depth_view.provider, depth_view.d3d12_resource, depth_view.width,
+                                depth_view.height, depth_view.format);
+        render_debug_view(vr, command_list, view_mode, debug_eye, backbuffer_dst, other_eye_dst);
+        return true;
+    }
+
+    UEVR_FrameResourceView velocity_view{};
+    if (!uevr_afw_bridge::get_latest_velocity(&velocity_view) || velocity_view.d3d12_resource == nullptr) {
+        SPDLOG_WARNING_EVERY_N_SEC(2, "[VR] Frame-resource debug velocity unavailable: provider={} validity={} reason={}",
+                                   velocity_view.provider, velocity_view.validity,
+                                   velocity_view.reason != nullptr ? velocity_view.reason : "");
+        return false;
+    }
+
+    auto& raw_velocity_desc = m_raw_velocity_desc[debug_eye];
+    if (raw_velocity_desc.pTexture != velocity_view.d3d12_resource ||
+        raw_velocity_desc.initialState != static_cast<D3D12_RESOURCE_STATES>(velocity_view.expected_state) ||
+        raw_velocity_desc.shaderResourceViewHandle.ptr == 0) {
+        raw_velocity_desc = afw_bridge_source_desc(velocity_view, Image);
+        vr->d3d12Renderer->SetupTextureDesc(raw_velocity_desc);
+    }
+
+    SPDLOG_INFO_EVERY_N_SEC(2, "[VR] OpenXR frame-resource debug view drawing {} provider={} ptr={} {}x{} fmt={}",
+                            VR::afw_debug_view_name(view_mode), velocity_view.provider,
+                            velocity_view.d3d12_resource, velocity_view.width,
+                            velocity_view.height, velocity_view.format);
+    render_debug_view(vr, command_list, view_mode, debug_eye, backbuffer_dst, other_eye_dst);
+    return true;
+}
+
+void D3D12Component::render_debug_view(VR* vr, ID3D12GraphicsCommandList* command_list, int view_mode, EyeIndex eye,
+                                       TextureDesc& backbuffer_dst, TextureDesc* other_eye_dst) {
+    if (vr == nullptr || vr->d3d12Renderer == nullptr || command_list == nullptr || view_mode <= 0) {
+        return;
+    }
+    auto device = g_framework->get_d3d12_hook()->get_device();
+    if (!setup_debug_view_pipeline(device)) {
+        return;
+    }
+
+    TextureDesc* input = nullptr;
+    uint32_t shader_mode = 0;
+    float scale = 1.0f;
+    bool transition_input = false;
+    D3D12_RESOURCE_STATES input_prev_state = D3D12_RESOURCE_STATE_COMMON;
+    switch (view_mode) {
+    case 1: input = &m_combined_debug_velocity_desc[eye]; shader_mode = 0; scale = 1.0f / 200.0f; break; // combined/PDAFW MV
+    case 2: input = &m_combined_debug_velocity_desc[eye]; shader_mode = 0; scale = 1.0f / 40.0f; break;  // boosted combined/PDAFW MV
+    case 3: input = &m_combined_debug_velocity_desc[eye]; shader_mode = 0; scale = 1.0f / 40.0f; break;  // reconstruct-only combined/PDAFW MV
+    case 4: input = &vr->depthDesc[eye];         shader_mode = 1; scale = 1.0f; break;          // depth
+    case 5: input = &m_raw_velocity_desc[eye];   shader_mode = 2; scale = 40.0f;                // source velocity direction
+            input_prev_state = input->initialState; transition_input = true; break;
+    case 6: input = &m_raw_velocity_desc[eye];   shader_mode = 3; scale = 80.0f;                // source velocity X
+            input_prev_state = input->initialState; transition_input = true; break;
+    case 7: input = &m_raw_velocity_desc[eye];   shader_mode = 4; scale = 80.0f;                // source velocity Y
+            input_prev_state = input->initialState; transition_input = true; break;
+    case 8: input = &m_raw_velocity_desc[eye];   shader_mode = 5; scale = 40.0f;                // source velocity magnitude
+            input_prev_state = input->initialState; transition_input = true; break;
+    case 9: input = &m_raw_velocity_desc[eye];   shader_mode = 6; scale = 1.0f;                 // source velocity validity
+            input_prev_state = input->initialState; transition_input = true; break;
+    default: return;
+    }
+    if (input == nullptr || input->pTexture == nullptr || input->shaderResourceViewHandle.ptr == 0) {
+        return;
+    }
+
+    const auto dst_desc = (other_eye_dst != nullptr && other_eye_dst->pTexture != nullptr)
+        ? other_eye_dst->pTexture->GetDesc() : backbuffer_dst.pTexture->GetDesc();
+    const uint32_t out_w = static_cast<uint32_t>(dst_desc.Width);
+    const uint32_t out_h = dst_desc.Height;
+
+    if (m_debug_view_tex.pTexture == nullptr ||
+        m_debug_view_tex.pTexture->GetDesc().Width != out_w || m_debug_view_tex.pTexture->GetDesc().Height != out_h) {
+        if (!vr->d3d12Renderer->CreateTexture(static_cast<int>(out_w), static_cast<int>(out_h),
+                                              DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
+                                              m_debug_view_tex, true)) {
+            return;
+        }
+        if (m_debug_view_tex.pTexture != nullptr) {
+            m_debug_view_tex.pTexture->SetName(L"UEVR AFW debug false color");
+        }
+        m_debug_view_tex.unorderedAccessViewHandle.ptr = 0;
+        m_debug_view_tex.uavPos = -1;
+    }
+    if (m_debug_view_tex.unorderedAccessViewHandle.ptr == 0 || m_debug_view_tex.uavPos < 0) {
+        const int uav = vr->d3d12Renderer->CreateUAV(m_debug_view_tex.pTexture);
+        if (uav < 0) {
+            return;
+        }
+        m_debug_view_tex.uavPos = uav;
+        m_debug_view_tex.unorderedAccessViewHandle = vr->d3d12Renderer->GetGPUDescriptorHandle(uav);
+    }
+
+    const auto in_desc = input->pTexture->GetDesc();
+    AFWDebugVizConstants c{};
+    c.mode = shader_mode; c.scale = scale;
+    c.input_size[0] = static_cast<uint32_t>(in_desc.Width); c.input_size[1] = in_desc.Height;
+    c.output_size[0] = out_w; c.output_size[1] = out_h;
+    if (c.input_size[0] == 0 || c.input_size[1] == 0 || c.output_size[0] == 0 || c.output_size[1] == 0) {
+        return;
+    }
+
+    ID3D12DescriptorHeap* heaps[] = { vr->d3d12Renderer->GetViewHeap() };
+    command_list->SetDescriptorHeaps(1, heaps);
+    command_list->SetComputeRootSignature(m_debug_view_root_signature.Get());
+    command_list->SetPipelineState(m_debug_view_pso.Get());
+    command_list->SetComputeRootDescriptorTable(0, input->shaderResourceViewHandle);
+    command_list->SetComputeRootDescriptorTable(1, m_debug_view_tex.unorderedAccessViewHandle);
+    command_list->SetComputeRoot32BitConstants(2, sizeof(AFWDebugVizConstants) / sizeof(uint32_t), &c, 0);
+
+    if (transition_input) {
+        auto st = input_prev_state;
+        if (st == D3D12_RESOURCE_STATE_COMMON) st = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        if ((st & D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) == 0) {
+            afw_transition_resource(command_list, input->pTexture, st, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            input_prev_state = st;
+        } else {
+            transition_input = false;
+        }
+    }
+    afw_transition_resource(command_list, m_debug_view_tex.pTexture, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    command_list->Dispatch((out_w + 7) / 8, (out_h + 7) / 8, 1);
+    afw_uav_barrier(command_list, m_debug_view_tex.pTexture);
+    afw_transition_resource(command_list, m_debug_view_tex.pTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+    if (transition_input) {
+        afw_transition_resource(command_list, input->pTexture, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                input_prev_state);
+    }
+
+    // Blit the false-colored buffer into both submitted eyes so it shows in the HMD / mirror.
+    if (other_eye_dst != nullptr && other_eye_dst->pTexture != nullptr) {
+        D3D12_VIEWPORT vp{0, 0, static_cast<float>(out_w), static_cast<float>(out_h), 0, 1};
+        vr->d3d12Renderer->Blit(command_list, *other_eye_dst, m_debug_view_tex, vp);
+    }
+    if (backbuffer_dst.pTexture != nullptr) {
+        const auto bb = backbuffer_dst.pTexture->GetDesc();
+        D3D12_VIEWPORT vp{0, 0, static_cast<float>(bb.Width), static_cast<float>(bb.Height), 0, 1};
+        vr->d3d12Renderer->Blit(command_list, backbuffer_dst, m_debug_view_tex, vp);
+    }
 }
 
 void D3D12Component::draw_spectator_view(ID3D12GraphicsCommandList* command_list, bool is_right_eye_frame) {
@@ -1310,6 +2674,15 @@ bool D3D12Component::setup() {
         backbuffer = real_backbuffer;
     }
 
+    if (backbuffer == nullptr && (vr->is_stereo_emulation_enabled() || afw_d3d12_allow_swapchain_backbuffer_fallback())) {
+        backbuffer = real_backbuffer;
+        if (vr->is_stereo_emulation_enabled()) {
+            SPDLOG_INFO_EVERY_N_SEC(1, "[VR] Stereo emulation: using DXGI swapchain backbuffer for D3D12 setup");
+        } else {
+            SPDLOG_WARNING_EVERY_N_SEC(1, "[VR] Fake stereo render target unavailable; using DXGI swapchain backbuffer for D3D12 setup");
+        }
+    }
+
     if (backbuffer == nullptr) {
         SPDLOG_ERROR_EVERY_N_SEC(1, "[VR] Failed to get back buffer (D3D12).");
         return false;
@@ -1329,7 +2702,7 @@ bool D3D12Component::setup() {
     backbuffer_desc.Flags &= ~D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
     backbuffer_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
 
-    if (!vr->is_extreme_compatibility_mode_enabled()) {
+    if (!vr->is_extreme_compatibility_mode_enabled() && !vr->is_stereo_emulation_enabled()) {
         backbuffer_desc.Width /= 2; // The texture we get from UE is both eyes combined. we will copy the regions later.
     }
 
@@ -1370,14 +2743,26 @@ bool D3D12Component::setup() {
     // #############################
     static uint32_t lastSize[2]{0, 0};
     static DXGI_FORMAT lastFormat = DXGI_FORMAT_UNKNOWN;
-    if ((lastSize[0] != vr->get_hmd_width() || lastSize[1] != vr->get_hmd_height() || lastFormat != backbuffer_desc.Format)) {
-        FrameWarpInitParams params = {vr->get_hmd_width(), vr->get_hmd_height(), backbuffer_desc.Format};
+    if (vr->m_rendering_method->value() == VR::RenderingMethod::ALTERNATE_FRAMEWARP && vr->d3d12Renderer == nullptr) {
+        SPDLOG_ERROR_EVERY_N_SEC(1, "[VR] Alternate Frame Warp requested, but PDAFWPlugin is unavailable");
+    }
+
+    if (vr->is_using_afw() &&
+        (lastSize[0] != vr->get_hmd_width() || lastSize[1] != vr->get_hmd_height() || lastFormat != backbuffer_desc.Format)) {
+        FrameWarpInitParams params = {static_cast<int>(vr->get_hmd_width()), static_cast<int>(vr->get_hmd_height()), backbuffer_desc.Format};
         spdlog::info("[VR] Before InitFrameWarp");
         m_eyeFrameBuffers = InitFrameWarp(params);
         spdlog::info("[VR] After InitFrameWarp");
-        spdlog::info("[VR] m_eyeFrameBuffers[0]: {} ", (void*)m_eyeFrameBuffers.eyeFrameBuffers->color.pTexture);
+        spdlog::info("[VR] m_eyeFrameBuffers[0]: {} ", (void*)m_eyeFrameBuffers.eyeFrameBuffers[0].color.pTexture);
+        if (m_eyeFrameBuffers.eyeFrameBuffers[0].color.pTexture == nullptr ||
+            m_eyeFrameBuffers.eyeFrameBuffers[1].color.pTexture == nullptr) {
+            spdlog::error("[VR] InitFrameWarp returned null eye frame buffers; disabling Alternate Frame Warp");
+            vr->d3d12Renderer = nullptr;
+            return false;
+        }
         lastSize[0] = vr->get_hmd_width();
         lastSize[1] = vr->get_hmd_height();
+        lastFormat = backbuffer_desc.Format;
     }
     // #############################
     // #Frame Warp Module End
@@ -1446,7 +2831,7 @@ bool D3D12Component::setup() {
         }
     }
 
-    if (!vr->is_extreme_compatibility_mode_enabled()) {
+    if (!vr->is_extreme_compatibility_mode_enabled() && !vr->is_stereo_emulation_enabled()) {
         m_backbuffer_size[0] = backbuffer_desc.Width * 2;
     } else {
         m_backbuffer_size[0] = backbuffer_desc.Width;

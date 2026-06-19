@@ -1,6 +1,7 @@
 #define NOMINMAX
 
 #include <fstream>
+#include <iterator>
 
 #include <windows.h>
 #include <dbt.h>
@@ -26,6 +27,23 @@
 #include "VR.hpp"
 
 #include <safetyhook.hpp>
+
+namespace {
+
+bool env_truthy_w(const wchar_t* name) {
+    wchar_t value[16]{};
+    const DWORD len = GetEnvironmentVariableW(name, value, static_cast<DWORD>(std::size(value)));
+    if (len == 0 || len >= std::size(value) || value[0] == L'\0') {
+        return false;
+    }
+
+    return value[0] != L'0' &&
+           _wcsicmp(value, L"false") != 0 &&
+           _wcsicmp(value, L"off") != 0 &&
+           _wcsicmp(value, L"no") != 0;
+}
+
+} // namespace
 
 NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_CreateFeature(
     ID3D12GraphicsCommandList* InCmdList, NVSDK_NGX_Feature InFeatureID, NVSDK_NGX_Parameter* InParameters, NVSDK_NGX_Handle** OutHandle) {
@@ -98,6 +116,29 @@ std::shared_ptr<VR>& VR::get() {
 std::optional<std::string> VR::clean_initialize() try {
     ZoneScopedN(__FUNCTION__);
 
+    if (env_truthy_w(L"UEVR_STEREO_EMULATION") || env_truthy_w(L"UEVR_ENABLE_STEREO_EMULATION")) {
+        m_stereo_emulation_mode = true;
+        spdlog::info("[VR] Stereo emulation mode forced by environment");
+    }
+
+    if (env_truthy_w(L"UEVR_RENDERDOC_CAPTURE_ONLY")) {
+        spdlog::info("[VR] Skipping VR runtime initialization for RenderDoc capture-only launch");
+        m_disable_vr = true;
+        m_runtime->loaded = false;
+        m_runtime->error = "VR runtime skipped for RenderDoc capture-only launch";
+        m_openvr->loaded = false;
+        m_openvr->is_hmd_active = false;
+        m_openvr->was_hmd_active = false;
+        m_openvr->needs_pose_update = false;
+        m_openvr->dll_missing = true;
+        m_openvr->error = "VR runtime skipped for RenderDoc capture-only launch";
+        m_openxr->loaded = false;
+        m_openxr->needs_pose_update = false;
+        m_openxr->dll_missing = true;
+        m_openxr->error = "VR runtime skipped for RenderDoc capture-only launch";
+        return Mod::on_initialize();
+    }
+
     auto openvr_error = initialize_openvr();
 
     if (openvr_error || !m_openvr->loaded) {
@@ -142,22 +183,35 @@ std::optional<std::string> VR::clean_initialize() try {
     // #Frame Warp Module Start
     // #############################
 
-    if (GetModuleHandleW(L"PDAFWPlugin.dll") == nullptr) {
+    HMODULE pdafw_module = GetModuleHandleW(L"PDAFWPlugin.dll");
+    if (pdafw_module == nullptr) {
         const auto current_path = utility::get_module_directoryw(GetModuleHandleW(L"UEVRBackend.dll"));
         if (current_path) {
             auto fspath = std::filesystem::path{*current_path} / L"PDAFWPlugin.dll";
-            if (LoadLibraryW(fspath.c_str()) == nullptr) {
-                spdlog::info("[VR] Could not load PDAFWPlugin.dll");
-            }
+            pdafw_module = LoadLibraryW(fspath.c_str());
         }
+    }
+
+    if (pdafw_module == nullptr) {
+        pdafw_module = LoadLibraryW(L"PDAFWPlugin.dll");
     }
 
     auto& hook = g_framework->get_d3d12_hook();
     hook->get_command_queue();
-    pd::DeviceParams params{};
-    params.d3d12Device = hook->get_device();
-    params.d3d12Queue = hook->get_command_queue();
-    d3d12Renderer = InitDevice(params);
+    d3d12Renderer = nullptr;
+
+    if (pdafw_module != nullptr) {
+        pd::DeviceParams params{};
+        params.d3d12Device = hook->get_device();
+        params.d3d12Queue = hook->get_command_queue();
+        d3d12Renderer = InitDevice(params);
+
+        if (d3d12Renderer == nullptr) {
+            spdlog::warn("[VR] PDAFWPlugin InitDevice returned null; Alternate Frame Warp is unavailable");
+        }
+    } else {
+        spdlog::info("[VR] PDAFWPlugin.dll not loaded; Alternate Frame Warp is unavailable");
+    }
 
     auto dllNGX = GetModuleHandle("_nvngx.dll");
     if (!dllNGX)
@@ -219,6 +273,13 @@ std::optional<std::string> VR::initialize_openvr() {
 
     m_openvr = std::make_shared<runtimes::OpenVR>();
     m_openvr->loaded = false;
+
+    if (env_truthy_w(L"UEVR_RENDERDOC_SKIP_OPENVR")) {
+        spdlog::info("[VR] Skipping OpenVR for RenderDoc capture launch");
+        m_openvr->dll_missing = true;
+        m_openvr->error = "OpenVR skipped for RenderDoc capture launch";
+        return Mod::on_initialize();
+    }
 
     const auto wants_openxr = m_requested_runtime_name->value() == "openxr_loader.dll";
 
@@ -2364,6 +2425,54 @@ void VR::on_present() {
         btn9 = false;
         m_enable_ui_fix->toggle();
     }
+
+    // Ctrl+Shift+V cycles the AFW debug buffer visualizer (no numpad required).
+    static bool btnDbgView = false;
+    const bool dbg_mod = (GetAsyncKeyState(VK_CONTROL) < 0) && (GetAsyncKeyState(VK_SHIFT) < 0);
+    if (dbg_mod && (GetAsyncKeyState('V') < 0) && btnDbgView == false) {
+        btnDbgView = true;
+        afw_debug_view = (afw_debug_view + 1) % afw_debug_view_count;
+        SPDLOG_INFO("[VR] AFW debug view = {} ({})", afw_debug_view,
+                    afw_debug_view_name(afw_debug_view));
+    }
+    if (GetAsyncKeyState('V') == 0 && btnDbgView == true) {
+        btnDbgView = false;
+    }
+
+    // Ctrl+Shift+T toggles the velocity-combine ClipToPrevClip transpose (matrix-convention test).
+    static bool btnDbgT = false;
+    if (dbg_mod && (GetAsyncKeyState('T') < 0) && btnDbgT == false) {
+        btnDbgT = true;
+        afw_combine_transpose = !afw_combine_transpose;
+        SPDLOG_INFO("[VR] AFW combine ClipToPrevClip transpose = {}", afw_combine_transpose ? 1 : 0);
+    }
+    if (GetAsyncKeyState('T') == 0 && btnDbgT == true) {
+        btnDbgT = false;
+    }
+
+    // Ctrl+Shift+R toggles reconstruct-from-depth-everywhere (ignore source velocity).
+    static bool btnDbgR = false;
+    if (dbg_mod && (GetAsyncKeyState('R') < 0) && btnDbgR == false) {
+        btnDbgR = true;
+        afw_force_reconstruct = !afw_force_reconstruct;
+        SPDLOG_INFO("[VR] AFW force-reconstruct (ignore source velocity) = {}", afw_force_reconstruct ? 1 : 0);
+    }
+    if (GetAsyncKeyState('R') == 0 && btnDbgR == true) {
+        btnDbgR = false;
+    }
+
+    // Ctrl+Shift+D requests a one-shot dump of the bridged raw velocity (captured inline in the
+    // combine) to afw_work/raw_velocity.bin — press while moving to capture a motion frame.
+    static bool btnDbgD = false;
+    if (dbg_mod && (GetAsyncKeyState('D') < 0) && btnDbgD == false) {
+        btnDbgD = true;
+        afw_dump_raw_velocity_request = true;
+        SPDLOG_INFO("[VR] AFW raw-velocity dump requested");
+    }
+    if (GetAsyncKeyState('D') == 0 && btnDbgD == true) {
+        btnDbgD = false;
+    }
+
     static bool btnAdd = false;
     if (GetAsyncKeyState(VK_ADD) < 0 && btnAdd == false) {
         btnAdd = true;

@@ -70,11 +70,21 @@ private:
 
     static bool find_free_element_hook_ue5(
         sdk::FRenderTargetPool* pool,
+        sdk::FRHICommandListBase* cmd_list,
         sdk::FPooledRenderTargetDesc* desc,
         TRefCountPtr<IPooledRenderTarget>* out,
         const wchar_t* name,
         // these arent uintptrs, just defending against future changes to the size of the params
-        uintptr_t a5, uintptr_t a6, uintptr_t a7, uintptr_t a8, uintptr_t a9, uintptr_t a10
+        uintptr_t a6, uintptr_t a7, uintptr_t a8, uintptr_t a9, uintptr_t a10
+    );
+
+    static TRefCountPtr<IPooledRenderTarget>* find_free_element_return_hook_ue5(
+        sdk::FRenderTargetPool* pool,
+        TRefCountPtr<IPooledRenderTarget>* out,
+        sdk::FRHICommandListBase* cmd_list,
+        sdk::FPooledRenderTargetDesc* desc,
+        const wchar_t* name,
+        uintptr_t a6, uintptr_t a7, uintptr_t a8, uintptr_t a9, uintptr_t a10
     );
 
     void on_post_find_free_element(sdk::FRenderTargetPool* pool, 
@@ -89,6 +99,7 @@ private:
 
     std::recursive_mutex m_mutex{};
     SafetyHookInline m_find_free_element_hook{};
+    SafetyHookInline m_find_free_element_return_hook{};
     std::unordered_map<std::wstring, IPooledRenderTarget*> m_render_targets{};
     std::unordered_set<std::wstring> m_seen_names{};
 };

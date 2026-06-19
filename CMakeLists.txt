@@ -59,7 +59,17 @@ endif()
 
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
+# UESDK is a private submodule, so keep the RenderDoc wrapper compatibility fix
+# as a local configure-time patch rather than editing/publishing the submodule.
+include(cmake/ApplyUESDKPatch.cmake)
+
 add_subdirectory(dependencies/submodules/UESDK)
+
+# Embedded RenderDoc capture: defines uevr_attach_full_renderdoc(), which copies
+# or, if UEVR_RENDERDOC_ALWAYS_BUILD=ON, rebuilds renderdoc.dll beside the
+# backend and builds the suspended launcher + smoke validator. Non-fatal if the
+# RenderDoc source/runtime is not present.
+include(cmake/RenderDocFull.cmake)
 
 include(FetchContent)
 
@@ -457,6 +467,98 @@ target_link_libraries(example_plugin PUBLIC
 unset(CMKR_TARGET)
 unset(CMKR_SOURCES)
 
+# Target afw_frame_resources
+set(CMKR_TARGET afw_frame_resources)
+set(afw_frame_resources_SOURCES "")
+
+list(APPEND afw_frame_resources_SOURCES
+	"plugins/afw_frame_resources/FrameResourceLog.cpp"
+	"plugins/afw_frame_resources/FrameResourceTracker.cpp"
+	"plugins/afw_frame_resources/Plugin.cpp"
+	"plugins/afw_frame_resources/providers/D3D12BindProvider.cpp"
+	"plugins/afw_frame_resources/providers/NgxDlssProvider.cpp"
+	"plugins/afw_frame_resources/providers/RenderTargetPoolProvider.cpp"
+	"plugins/afw_frame_resources/FrameResourceLog.hpp"
+	"plugins/afw_frame_resources/FrameResourceTracker.hpp"
+	"plugins/afw_frame_resources/FrameResourceTypes.hpp"
+	"plugins/afw_frame_resources/providers/D3D12BindProvider.hpp"
+	"plugins/afw_frame_resources/providers/NgxDlssProvider.hpp"
+	"plugins/afw_frame_resources/providers/PooledRenderTargetLayout.hpp"
+	"plugins/afw_frame_resources/providers/RenderTargetPoolProvider.hpp"
+	"plugins/afw_frame_resources/include/UEVRFrameResourcesAPI.h"
+)
+
+list(APPEND afw_frame_resources_SOURCES
+	cmake.toml
+)
+
+set(CMKR_SOURCES ${afw_frame_resources_SOURCES})
+add_library(afw_frame_resources SHARED)
+
+if(afw_frame_resources_SOURCES)
+	target_sources(afw_frame_resources PRIVATE ${afw_frame_resources_SOURCES})
+endif()
+
+source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${afw_frame_resources_SOURCES})
+
+target_compile_features(afw_frame_resources PUBLIC
+	cxx_std_23
+)
+
+target_include_directories(afw_frame_resources PUBLIC
+	"include/"
+	"examples/renderlib"
+)
+
+target_link_libraries(afw_frame_resources PUBLIC
+	plugin_renderlib
+)
+
+unset(CMKR_TARGET)
+unset(CMKR_SOURCES)
+
+# Target afw_frame_resources_selftest
+set(CMKR_TARGET afw_frame_resources_selftest)
+set(afw_frame_resources_selftest_SOURCES "")
+
+list(APPEND afw_frame_resources_selftest_SOURCES
+	"plugins/afw_frame_resources/FrameResourceTracker.cpp"
+	"plugins/afw_frame_resources/FrameResourceLog.cpp"
+	"plugins/afw_frame_resources/tools/selftest_main.cpp"
+	"plugins/afw_frame_resources/FrameResourceTracker.hpp"
+	"plugins/afw_frame_resources/FrameResourceTypes.hpp"
+	"plugins/afw_frame_resources/FrameResourceLog.hpp"
+)
+
+list(APPEND afw_frame_resources_selftest_SOURCES
+	cmake.toml
+)
+
+set(CMKR_SOURCES ${afw_frame_resources_selftest_SOURCES})
+add_executable(afw_frame_resources_selftest)
+
+if(afw_frame_resources_selftest_SOURCES)
+	target_sources(afw_frame_resources_selftest PRIVATE ${afw_frame_resources_selftest_SOURCES})
+endif()
+
+get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+if(NOT CMKR_VS_STARTUP_PROJECT)
+	set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT afw_frame_resources_selftest)
+endif()
+
+source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${afw_frame_resources_selftest_SOURCES})
+
+target_compile_features(afw_frame_resources_selftest PRIVATE
+	cxx_std_23
+)
+
+target_include_directories(afw_frame_resources_selftest PRIVATE
+	"plugins/afw_frame_resources"
+)
+
+unset(CMKR_TARGET)
+unset(CMKR_SOURCES)
+
 # Target sdk-test
 set(CMKR_TARGET sdk-test)
 set(sdk-test_SOURCES "")
@@ -779,6 +881,7 @@ list(APPEND uevr_SOURCES
 	"src/mods/pluginloader/FUObjectArrayFunctions.cpp"
 	"src/mods/pluginloader/UScriptStructFunctions.cpp"
 	"src/mods/uobjecthook/SDKDumper.cpp"
+	"src/mods/vr/AFWFrameResourcesBridge.cpp"
 	"src/mods/vr/Bindings.cpp"
 	"src/mods/vr/CVarManager.cpp"
 	"src/mods/vr/D3D11Component.cpp"
@@ -792,6 +895,9 @@ list(APPEND uevr_SOURCES
 	"src/mods/vr/d3d12/TextureContext.cpp"
 	"src/mods/vr/runtimes/OpenVR.cpp"
 	"src/mods/vr/runtimes/OpenXR.cpp"
+	"src/render/RenderDocCaptureControl.cpp"
+	"src/render/RenderDocCaptureService.cpp"
+	"src/render/RenderDocDxgiProofHooks.cpp"
 	"src/uevr-imgui/imgui_impl_dx11.cpp"
 	"src/uevr-imgui/imgui_impl_dx12.cpp"
 	"src/uevr-imgui/imgui_impl_win32.cpp"
@@ -822,6 +928,7 @@ list(APPEND uevr_SOURCES
 	"src/mods/pluginloader/FUObjectArrayFunctions.hpp"
 	"src/mods/pluginloader/UScriptStructFunctions.hpp"
 	"src/mods/uobjecthook/SDKDumper.hpp"
+	"src/mods/vr/AFWFrameResourcesBridge.hpp"
 	"src/mods/vr/CVarManager.hpp"
 	"src/mods/vr/D3D11Component.hpp"
 	"src/mods/vr/D3D12Component.hpp"
@@ -839,6 +946,9 @@ list(APPEND uevr_SOURCES
 	"src/mods/vr/runtimes/VRRuntime.hpp"
 	"src/mods/vr/shaders/ps.hpp"
 	"src/mods/vr/shaders/vs.hpp"
+	"src/render/RenderDocCaptureControl.hpp"
+	"src/render/RenderDocCaptureService.hpp"
+	"src/render/RenderDocDxgiProofHooks.hpp"
 	"src/uevr-imgui/font_robotomedium.hpp"
 	"src/uevr-imgui/uevr_imconfig.hpp"
 	"src/utility/ImGui.hpp"
@@ -876,6 +986,7 @@ target_include_directories(uevr PUBLIC
 	"src/"
 	"include/"
 	"${OPENXR_SOURCE_DIR}/src"
+	"dependencies/vendor/renderdoc"
 )
 
 target_link_libraries(uevr PUBLIC
@@ -936,6 +1047,10 @@ add_custom_command(
 add_custom_command(
     TARGET uevr POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:openvr> $<TARGET_FILE_DIR:uevr>)
+
+# Build the RenderDoc launcher + smoke tools and stage renderdoc.dll beside
+# UEVRBackend.dll. No-op if RenderDoc is not available on this machine.
+uevr_attach_full_renderdoc(uevr)
 
 unset(CMKR_TARGET)
 unset(CMKR_SOURCES)
