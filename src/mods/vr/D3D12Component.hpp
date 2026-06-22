@@ -99,6 +99,10 @@ private:
     ComPtr<ID3D12RootSignature> m_velocity_combine_root_signature{};
     ComPtr<ID3D12PipelineState> m_velocity_combine_pso{};
     std::array<TextureDesc, 2> m_raw_velocity_desc{};
+    // Per-eye full 3D velocity (RGBA16F): .xy = combined screen motion (pixels), .z = depth motion
+    // V.z = DeviceZ - PrevDeviceZ. Second combine output (u1); motionVectorsDesc stays RG16F for PDAFW.
+    // For PureDark's 3D reprojection + the "combined Z" debug view.
+    std::array<TextureDesc, 2> m_combined_velocity_3d_desc{};
 
     // AFW debug buffer visualizer pipeline + scratch false-color target.
     ComPtr<ID3D12RootSignature> m_debug_view_root_signature{};

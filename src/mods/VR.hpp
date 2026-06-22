@@ -988,7 +988,9 @@ private:
             "Per-Object Velocity X",
             "Per-Object Velocity Y",
             "Per-Object Velocity Magnitude",
-            "Per-Object Velocity Validity"
+            "Per-Object Velocity Validity",
+            "Source Velocity Z (depth motion)",
+            "Combined Velocity Z (depth motion)"
         },
         0)
     };

@@ -10,11 +10,12 @@ RWTexture2D<float4> OutColor : register(u0);
 
 cbuffer DebugVizConstants : register(b0)
 {
-    uint   Mode;        // 0=pixel MV hue, 1=depth, 2=source MV hue, 3=source X, 4=source Y, 5=source mag, 6=source valid
+    uint   Mode;        // 0=pixel MV hue,1=depth,2=src MV hue,3=src X,4=src Y,5=src mag,6=src valid,7=src Z,8=combined Z
     float  Scale;       // magnitude normalization for velocity modes
     uint2  InputSize;
     uint2  OutputSize;
-    uint2  _pad;
+    uint   SourceEncoded; // 1 = source is UE-encoded RGBA16_UNORM (decode V.z from B+A); 0 = not encoded
+    uint   _pad;
 };
 
 float3 hsv2rgb(float3 c)
@@ -85,6 +86,25 @@ void DebugVisualizeCS(uint3 tid : SV_DispatchThreadID)
     {
         const float valid = (raw.x != 0.0f || raw.y != 0.0f) ? 1.0f : 0.0f;
         col = valid.xxx;
+    }
+    else if (Mode == 7)
+    {
+        // Source per-object depth velocity V.z (DeviceZ - PrevDeviceZ), decoded from the encoded buffer's
+        // B (.z = high 16 bits) and A (.w = low 16 bits) channels. Red = nearer, blue = farther.
+        float vz = 0.0f;
+        if (SourceEncoded != 0u)
+        {
+            const uint zHi = (uint)(raw.z * 65535.0f + 0.5f);
+            const uint zLo = ((uint)(raw.w * 65535.0f + 0.5f)) & 0xFFFEu;
+            const float d = asfloat((zHi << 16) | zLo);
+            vz = isfinite(d) ? d : 0.0f;
+        }
+        col = SignedChannelColor(vz * Scale);
+    }
+    else if (Mode == 8)
+    {
+        // Combined depth velocity V.z (already-decoded float in the combine output .z channel).
+        col = SignedChannelColor(raw.z * Scale);
     }
     else
     {

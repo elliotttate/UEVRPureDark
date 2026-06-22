@@ -1,6 +1,12 @@
 Texture2D<float4> VelocityTexture : register(t0);
 Texture2D<float> DepthTexture : register(t1);
+// u0: .xy = combined screen-space motion in PIXELS (DLSS-equivalent) -> RG16F. Consumed by the AFW warp;
+// kept 32-bit so PDAFW's raw CopyResource stays valid.
 RWTexture2D<float2> OutVelocityCombinedTexture : register(u0);
+// u1: full 3D velocity -> RGBA16F. .xy = same screen motion (pixels), .z = depth motion V.z = DeviceZ -
+// PrevDeviceZ (engine per-object value where written, camera reconstruction elsewhere), .w = 0. For
+// PureDark's 3D reprojection (two-frame object tracking) and the "combined Z" debug view.
+RWTexture2D<float4> OutVelocity3DTexture : register(u1);
 
 cbuffer VelocityCombineConstants : register(b0)
 {
@@ -68,6 +74,7 @@ void VelocityCombineCS(uint3 dispatchThreadId : SV_DispatchThreadID)
     // so the warp has a trustworthy camera-motion field everywhere depth exists (incl. the guard-band
     // borders), regardless of what the flaky engine-velocity provider hands us this frame.
     float2 reconVel = 0.0f;
+    float reconVelZ = 0.0f;
     {
         // The engine renders depth at a NARROWER FOV than the VR eye, so the guard-band periphery (and the
         // far sky) have depth==0 (reverse-Z far plane / cleared). At exactly 0 the reprojected w collapses
@@ -86,10 +93,14 @@ void VelocityCombineCS(uint3 dispatchThreadId : SV_DispatchThreadID)
             // NDC delta -> pixel space, negated to match the stored sign convention (and the raw source).
             const float2 ndcVel = clipPos.xy - (prevClipPos.xy / prevClipPos.w);
             reconVel = -(ndcVel * float2(0.5f, -0.5f) * float2(OutputSize));
+            // V.z = DeviceZ - PrevDeviceZ: camera-induced depth motion, from the SAME reprojection as the .xy.
+            // Exact for static geometry; gives the depth-parallax term everywhere depth exists.
+            reconVelZ = clipPos.z - (prevClipPos.z / prevClipPos.w);
         }
     }
 
     float2 outVelocity = reconVel;
+    float outVz = reconVelZ;
 
     // (2) PER-OBJECT MOTION ONLY (deviation-gated). NOTE: this is the CORRECT ADAPTATION of DLSS's
     // VelocityCombine.usf selection for OUR input, NOT a hand-rolled hack — and we proved it empirically.
@@ -121,6 +132,12 @@ void VelocityCombineCS(uint3 dispatchThreadId : SV_DispatchThreadID)
                 // mid-range .x -> small velocity, only genuinely-fast pixels stay large.
                 vScreen = sign(vScreen) * vScreen * vScreen * 0.5f;
                 outVelocity = -vScreen * float2(0.5f, -0.5f) * float2(OutputSize);
+                // Per-object depth motion V.z (DeviceZ - PrevDeviceZ) is packed by EncodeVelocityToTexture as a
+                // float32 split across .z (high 16 bits) and .w (low 16 bits; bit0 = pixel-anim flag). Reassemble
+                // it — the engine's TRUE per-object depth velocity, overriding the camera reconstruction here.
+                const uint zHi = (uint)(encodedVelocity.z * 65535.0f + 0.5f);
+                const uint zLo = ((uint)(encodedVelocity.w * 65535.0f + 0.5f)) & 0xFFFEu;
+                outVz = asfloat((zHi << 16) | zLo);
             }
         }
         else
@@ -145,5 +162,8 @@ void VelocityCombineCS(uint3 dispatchThreadId : SV_DispatchThreadID)
     // Final clamp: a motion vector can never legitimately exceed the frame dimensions, so this bounds any
     // residual garbage (a bad raw sample or a near-clip reconstruct) instead of warping with it.
     outVelocity = clamp(outVelocity, -float2(OutputSize), float2(OutputSize));
-    OutVelocityCombinedTexture[outputPixel] = outVelocity;
+    // Depth delta in reverse-Z device space can never exceed [-1,1]; bound any garbage decode (and reject NaN).
+    outVz = isfinite(outVz) ? clamp(outVz, -1.0f, 1.0f) : 0.0f;
+    OutVelocityCombinedTexture[outputPixel] = outVelocity;                   // .xy -> RG16F (u0), AFW warp
+    OutVelocity3DTexture[outputPixel] = float4(outVelocity, outVz, 0.0f);    // xyz -> RGBA16F (u1), 3D
 }

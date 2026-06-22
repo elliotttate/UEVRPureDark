@@ -57,11 +57,12 @@ static_assert(sizeof(AFWVelocityCombineConstants) == 36 * sizeof(uint32_t));
 // Constant buffer for the AFW debug buffer visualizer (afw_debug_visualize_cs.fx). Layout must match
 // the cbuffer in that shader (8 x 32-bit).
 struct AFWDebugVizConstants {
-    uint32_t mode{};        // 0 MV hue, 1 depth, 2 MV hue, 3 vel X, 4 vel Y, 5 vel magnitude, 6 valid
+    uint32_t mode{};        // 0 MV hue,1 depth,2 MV hue,3 vel X,4 vel Y,5 vel mag,6 valid,7 src Z,8 combined Z
     float scale{1.0f};
     uint32_t input_size[2]{};
     uint32_t output_size[2]{};
-    uint32_t pad[2]{};
+    uint32_t source_encoded{}; // 1 = source is encoded RGBA16_UNORM (decode V.z from B+A)
+    uint32_t pad{};
 };
 static_assert(sizeof(AFWDebugVizConstants) == 8 * sizeof(uint32_t));
 
@@ -1298,7 +1299,14 @@ bool D3D12Component::setup_velocity_combine_pipeline(ID3D12Device* device) {
     output_uav_range.RegisterSpace = 0;
     output_uav_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-    D3D12_ROOT_PARAMETER root_parameters[4]{};
+    D3D12_DESCRIPTOR_RANGE output_uav_3d_range{};
+    output_uav_3d_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    output_uav_3d_range.NumDescriptors = 1;
+    output_uav_3d_range.BaseShaderRegister = 1; // register u1 (full 3D velocity)
+    output_uav_3d_range.RegisterSpace = 0;
+    output_uav_3d_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_ROOT_PARAMETER root_parameters[5]{};
     root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     root_parameters[0].DescriptorTable.NumDescriptorRanges = 1;
     root_parameters[0].DescriptorTable.pDescriptorRanges = &velocity_srv_range;
@@ -1319,6 +1327,11 @@ bool D3D12Component::setup_velocity_combine_pipeline(ID3D12Device* device) {
     root_parameters[3].Constants.RegisterSpace = 0;
     root_parameters[3].Constants.Num32BitValues = sizeof(AFWVelocityCombineConstants) / sizeof(uint32_t);
     root_parameters[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    root_parameters[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    root_parameters[4].DescriptorTable.NumDescriptorRanges = 1;
+    root_parameters[4].DescriptorTable.pDescriptorRanges = &output_uav_3d_range;
+    root_parameters[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_ROOT_SIGNATURE_DESC root_signature_desc{};
     root_signature_desc.NumParameters = sizeof(root_parameters) / sizeof(root_parameters[0]);
@@ -1438,6 +1451,35 @@ bool D3D12Component::combine_ue_velocity_for_afw(
         return false;
     }
 
+    // Per-eye full-3D velocity target (RGBA16F), the combine's SECOND output (u1). .xy = combined screen motion,
+    // .z = depth motion V.z. Kept separate from motionVectorsDesc (which stays RG16F so PDAFW's raw CopyResource
+    // is valid). PureDark's 3D reprojection + the "combined Z" debug view read this.
+    auto& output_3d_desc = m_combined_velocity_3d_desc[eye];
+    {
+        const auto od = output_desc.pTexture->GetDesc();
+        if (output_3d_desc.pTexture == nullptr ||
+            output_3d_desc.pTexture->GetDesc().Width != od.Width ||
+            output_3d_desc.pTexture->GetDesc().Height != od.Height) {
+            if (!vr->d3d12Renderer->CreateTexture(static_cast<int>(od.Width), static_cast<int>(od.Height),
+                    DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, output_3d_desc, true)) {
+                SPDLOG_ERROR_EVERY_N_SEC(1, "[VR] AFW failed to create 3D velocity target");
+                return false;
+            }
+            output_3d_desc.pTexture->SetName(L"UEVR AFW combined velocity 3D");
+            output_3d_desc.unorderedAccessViewHandle.ptr = 0;
+            output_3d_desc.uavPos = -1;
+        }
+        if (output_3d_desc.unorderedAccessViewHandle.ptr == 0 || output_3d_desc.uavPos < 0) {
+            const int uav_pos = vr->d3d12Renderer->CreateUAV(output_3d_desc.pTexture);
+            if (uav_pos < 0) {
+                SPDLOG_ERROR_EVERY_N_SEC(1, "[VR] AFW failed to create 3D velocity UAV");
+                return false;
+            }
+            output_3d_desc.uavPos = uav_pos;
+            output_3d_desc.unorderedAccessViewHandle = vr->d3d12Renderer->GetGPUDescriptorHandle(uav_pos);
+        }
+    }
+
     // DIAGNOSTIC: ON-DEMAND dump of the ACTUAL velocity/depth/combined bytes. Gated by env
     // UEVR_AFW_VELDUMP=1. Create the trigger file afw_work\DUMP_NOW (e.g. WHILE driving the pawn so the
     // buffers hold a motion frame) and the next combine call dumps raw_velocity_<N>.bin /
@@ -1456,6 +1498,8 @@ bool D3D12Component::combine_ue_velocity_for_afw(
             afw_dump_texture_to_disk(device, queue, raw_velocity_desc.pTexture, raw_velocity_desc.initialState, path);
             std::snprintf(path, sizeof(path), "E:\\Github\\UEVRPureDark\\afw_work\\combined_velocity_%d.bin", n);
             afw_dump_texture_to_disk(device, queue, output_desc.pTexture, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, path);
+            std::snprintf(path, sizeof(path), "E:\\Github\\UEVRPureDark\\afw_work\\combined_velocity_3d_%d.bin", n);
+            afw_dump_texture_to_disk(device, queue, output_3d_desc.pTexture, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, path);
             std::snprintf(path, sizeof(path), "E:\\Github\\UEVRPureDark\\afw_work\\depth_%d.bin", n);
             afw_dump_texture_to_disk(device, queue, depth_desc.pTexture, depth_desc.initialState, path);
             SPDLOG_INFO("[VR] AFW VELDUMP #{} wrote raw_velocity_{}/combined_velocity_{}/depth_{} (eye={} {}x{})",
@@ -1653,6 +1697,7 @@ bool D3D12Component::combine_ue_velocity_for_afw(
     command_list->SetComputeRootDescriptorTable(2, output_desc.unorderedAccessViewHandle);
     command_list->SetComputeRoot32BitConstants(
         3, sizeof(AFWVelocityCombineConstants) / sizeof(uint32_t), &constants, 0);
+    command_list->SetComputeRootDescriptorTable(4, output_3d_desc.unorderedAccessViewHandle);
 
     auto velocity_state = raw_velocity_desc.initialState;
     if (velocity_state == D3D12_RESOURCE_STATE_COMMON) {
@@ -1665,11 +1710,16 @@ bool D3D12Component::combine_ue_velocity_for_afw(
     }
     afw_transition_resource(command_list, output_desc.pTexture, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    afw_transition_resource(command_list, output_3d_desc.pTexture, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     command_list->Dispatch((constants.output_size[0] + 7) / 8, (constants.output_size[1] + 7) / 8, 1);
 
     afw_uav_barrier(command_list, output_desc.pTexture);
+    afw_uav_barrier(command_list, output_3d_desc.pTexture);
     afw_transition_resource(command_list, output_desc.pTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+    afw_transition_resource(command_list, output_3d_desc.pTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                             D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
     if (transition_velocity) {
         afw_transition_resource(command_list, raw_velocity_desc.pTexture,
@@ -1755,6 +1805,9 @@ void D3D12Component::render_debug_view(VR* vr, ID3D12GraphicsCommandList* comman
     case 6: input = &m_raw_velocity_desc[eye];   shader_mode = 4; scale = 3.0f;          break; // per-object velocity Y
     case 7: input = &m_raw_velocity_desc[eye];   shader_mode = 5; scale = 3.0f;          break; // per-object velocity magnitude
     case 8: input = &m_raw_velocity_desc[eye];   shader_mode = 6; scale = 1.0f;          break; // per-object velocity validity
+    // Depth-motion V.z (the new 3D .z). Tiny device-Z deltas (~5e-4), so a large scale to make them readable.
+    case 9:  input = &m_raw_velocity_desc[eye];         shader_mode = 7; scale = 2000.0f; break; // raw source velocity Z (depth motion)
+    case 10: input = &m_combined_velocity_3d_desc[eye]; shader_mode = 8; scale = 2000.0f; break; // combined velocity Z (depth motion)
     default: return;
     }
     // Live magnitude knob for the velocity false-color (so the gradient can be dialed without rebuilds).
@@ -1811,6 +1864,8 @@ void D3D12Component::render_debug_view(VR* vr, ID3D12GraphicsCommandList* comman
     c.mode = shader_mode; c.scale = scale;
     c.input_size[0] = input_w; c.input_size[1] = in_desc.Height;
     c.output_size[0] = eye_w; c.output_size[1] = out_h;
+    // Mode 7 (source Z) decodes V.z from the encoded RGBA16_UNORM source; flag whether the input is that format.
+    c.source_encoded = (in_desc.Format == DXGI_FORMAT_R16G16B16A16_UNORM) ? 1u : 0u;
     if (c.input_size[0] == 0 || c.input_size[1] == 0 || c.output_size[0] == 0 || c.output_size[1] == 0) {
         return;
     }
