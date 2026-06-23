@@ -23,6 +23,9 @@ cbuffer VelocityCombineConstants : register(b0)
     float SourceScale;      // multiplier applied to the engine (source) velocity; tunes AFW warp strength
     uint VelocityEncoded;   // 1 = velocity is UE-ENCODED RGBA16_UNORM (decode it); 0 = decoded R16G16_FLOAT
     uint Write3D;           // 1 = also write the 3D velocity to u1 (opt-in via UEVR_AFW_3D_VELOCITY); 0 = skip
+    column_major float4x4 ClipToOtherClip; // this-eye clip -> OTHER-eye clip (current frame) for stereo disparity
+    uint CorrectDisparity;  // 1 = subtract the inter-eye disparity from the per-object (encoded) velocity (AFR fix)
+    uint3 _pad;
 };
 
 uint2 ScaledPixel(uint2 outputPixel, uint2 origin, uint2 extent, uint2 inputSize)
@@ -75,6 +78,7 @@ void VelocityCombineCS(uint3 dispatchThreadId : SV_DispatchThreadID)
     // borders), regardless of what the flaky engine-velocity provider hands us this frame.
     float2 reconVel = 0.0f;
     float reconVelZ = 0.0f;
+    float2 disparityVel = 0.0f; // inter-eye stereo disparity in pixels (this eye -> other eye), if CorrectDisparity
     {
         // The engine renders depth at a NARROWER FOV than the VR eye, so the guard-band periphery (and the
         // far sky) have depth==0 (reverse-Z far plane / cleared). At exactly 0 the reprojected w collapses
@@ -96,6 +100,20 @@ void VelocityCombineCS(uint3 dispatchThreadId : SV_DispatchThreadID)
             // V.z = DeviceZ - PrevDeviceZ: camera-induced depth motion, from the SAME reprojection as the .xy.
             // Exact for static geometry; gives the depth-parallax term everywhere depth exists.
             reconVelZ = clipPos.z - (prevClipPos.z / prevClipPos.w);
+        }
+        // Inter-eye disparity at this pixel (this eye -> other eye, SAME frame): the same depth-driven
+        // reprojection as reconVel but across eyes. AFR makes UE compute a moving object's velocity vs the
+        // previous frame = the OTHER eye, so the encoded velocity carries this disparity -> the warp throws the
+        // object to a second screen position (the 2-position-per-eye flicker). Subtracting it (below, encoded
+        // path only) leaves the true same-eye object motion.
+        if (CorrectDisparity != 0u)
+        {
+            const float4 otherClipPos = mul(ClipToOtherClip, clipPos);
+            if (otherClipPos.w > 1e-4f)
+            {
+                const float2 dispNdc = clipPos.xy - (otherClipPos.xy / otherClipPos.w);
+                disparityVel = -(dispNdc * float2(0.5f, -0.5f) * float2(OutputSize));
+            }
         }
     }
 
@@ -132,6 +150,9 @@ void VelocityCombineCS(uint3 dispatchThreadId : SV_DispatchThreadID)
                 // mid-range .x -> small velocity, only genuinely-fast pixels stay large.
                 vScreen = sign(vScreen) * vScreen * vScreen * 0.5f;
                 outVelocity = -vScreen * float2(0.5f, -0.5f) * float2(OutputSize);
+                // Strip the AFR inter-eye disparity that UE baked into this object's velocity (it computed it vs
+                // the previous frame = the other eye). Leaves the true same-eye motion -> no 2-position flicker.
+                outVelocity -= disparityVel;
                 // Per-object depth motion V.z (DeviceZ - PrevDeviceZ) is packed by EncodeVelocityToTexture as a
                 // float32 split across .z (high 16 bits) and .w (low 16 bits; bit0 = pixel-anim flag). Reassemble
                 // it — the engine's TRUE per-object depth velocity, overriding the camera reconstruction here.

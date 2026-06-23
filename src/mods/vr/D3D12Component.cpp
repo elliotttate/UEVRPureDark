@@ -50,9 +50,16 @@ struct AFWVelocityCombineConstants {
     float source_scale{1.0f};
     uint32_t velocity_encoded{}; // 1 = velocity SRV is the ENCODED RGBA16_UNORM buffer (decode in shader)
     uint32_t write_3d{};         // 1 = also write the full 3D velocity to u1 (opt-in); 0 = skip (default)
+    // this-eye clip -> OTHER-eye clip (CURRENT frame). Used to remove the inter-eye stereo disparity that AFR
+    // bakes into the engine's per-object velocity (UE computes a moving object's velocity vs the previous frame,
+    // which under AFR is the OTHER eye, so the value carries the disparity -> the warp throws moving objects to a
+    // second position = the 2-position-per-eye flicker). Subtracting the disparity leaves true same-eye motion.
+    float clip_to_other_clip[16]{};
+    uint32_t correct_disparity{}; // 1 = subtract the inter-eye disparity from the per-object (encoded) velocity
+    uint32_t _pad[3]{};
 };
 
-static_assert(sizeof(AFWVelocityCombineConstants) == 36 * sizeof(uint32_t));
+static_assert(sizeof(AFWVelocityCombineConstants) == 56 * sizeof(uint32_t));
 
 // Constant buffer for the AFW debug buffer visualizer (afw_debug_visualize_cs.fx). Layout must match
 // the cbuffer in that shader (8 x 32-bit).
@@ -1572,10 +1579,18 @@ bool D3D12Component::combine_ue_velocity_for_afw(
         // Compare fresh vs ghosting: near/far live in P22/P32, the FOV scale in P00/P11.
         if (std::getenv("UEVR_AFW_PROJ_TRACE") != nullptr) {
             static int s_pt[2]{0, 0};
-            if ((s_pt[ei]++ % 90) == 0) {
+            if ((s_pt[ei]++ % 60) == 0) {
                 const auto& P = camera_data.srcViewToClipMatrix;
-                SPDLOG_INFO("[AFW projtrace] eye={} P00={:.5f} P11={:.5f} P22={:.6f} P32={:.6f} P23={:.5f} P33={:.5f}",
-                            (int)eye, P[0][0], P[1][1], P[2][2], P[3][2], P[2][3], P[3][3]);
+                const auto& V2W = camera_data.srcViewToWorldMatrix;
+                // eyePos = per-eye world position (translation column of view->world). eye0 vs eye1 MUST differ
+                // by the IPD (the stereo offset) — that disparity is what the AFW stereo reprojection warps by.
+                // If ghosting collapses eye0/eye1 to the SAME position (or the same view orientation), the warp
+                // has no per-eye disparity -> the warped eye DOUBLES (the symptom). Compare eye0-vs-eye1 ON vs
+                // OFF, same controlled way as the depth dump. right = view X axis in world (the IPD direction).
+                SPDLOG_INFO("[AFW projtrace] eye={} P00={:.5f} P11={:.5f} P32={:.6f} | eyePos=({:.4f},{:.4f},{:.4f}) right=({:.4f},{:.4f},{:.4f})",
+                            (int)eye, P[0][0], P[1][1], P[3][2],
+                            V2W[3][0], V2W[3][1], V2W[3][2],
+                            V2W[0][0], V2W[0][1], V2W[0][2]);
             }
         }
 
@@ -1618,14 +1633,31 @@ bool D3D12Component::combine_ue_velocity_for_afw(
         }
     }
 
+    // Inter-eye disparity reprojection (this eye -> OTHER eye, CURRENT frame), built from the OTHER eye's
+    // matrices the same way clip_to_prev_clip is built from the prev frame. Used to subtract the stereo
+    // disparity that AFR bakes into the engine per-object velocity (the 2-position-per-eye flicker on moving
+    // objects). Same depth-driven reprojection math as reconVel, just across eyes instead of across time.
+    glm::mat4 clip_to_other_clip{};
+    {
+        const int other_ei = (eye == static_cast<EyeIndex>(1)) ? 0 : 1;
+        const auto& cam_other = vr->cameraData[other_ei];
+        clip_to_other_clip =
+            cam_other.srcViewToClipMatrix *
+            cam_other.srcWorldToViewMatrix *
+            camera_data.srcViewToWorldMatrix *
+            camera_data.srcClipToViewMatrix;
+    }
+
     // UE matrices vs glm/HLSL column-major can disagree on handedness; live menu toggle so the correct
     // convention can be confirmed against the warp without rebuilding (UEVRPureDark4 parity).
     if (vr->m_afw_combine_transpose->value()) {
         clip_to_prev_clip = glm::transpose(clip_to_prev_clip);
+        clip_to_other_clip = glm::transpose(clip_to_other_clip);
     }
 
     AFWVelocityCombineConstants constants{};
     std::memcpy(constants.clip_to_prev_clip, &clip_to_prev_clip[0][0], sizeof(constants.clip_to_prev_clip));
+    std::memcpy(constants.clip_to_other_clip, &clip_to_other_clip[0][0], sizeof(constants.clip_to_other_clip));
     constants.output_size[0] = static_cast<uint32_t>(output_resource_desc.Width);
     constants.output_size[1] = output_resource_desc.Height;
     constants.inv_output_size[0] = constants.output_size[0] > 0 ? 1.0f / static_cast<float>(constants.output_size[0]) : 0.0f;
@@ -1641,22 +1673,33 @@ bool D3D12Component::combine_ue_velocity_for_afw(
     // 0 = hybrid: use the engine's per-object velocity for moving objects, reconstruct camera motion for
     // static geometry (so the character reprojects onto itself AND head motion still warps the scene).
     // 1 = camera-only everywhere (objects ghost). Live toggle for comparison.
-    // Ghosting-fix velocity safeguard. The ghosting fix leaves the DEPTH untouched (proven byte-identical fresh
-    // vs ghosting, see afw-ghosting-fix-depth-conflict), but the engine VELOCITY it produces carries the OTHER
-    // eye's motion (confirmed by PureDark). The per-object velocity override would then warp moving objects in
-    // the wrong direction under ghosting. The depth+camera reconstruction (reconVel) is proven correct, so when
-    // ghosting is active drive the warp from reconstruction alone — moving objects warp by camera motion (clean)
-    // instead of contaminated velocity (wrong); static geometry is unaffected (reconVel already owns it). Opt
-    // out with UEVR_AFW_GHOSTING_KEEP_VELOCITY=1 (e.g. once PureDark's per-eye velocity shader lands). Normal
-    // (non-ghosting) mode keeps the per-object velocity path unchanged.
-    static const bool s_ghosting_keep_velocity = []() {
-        const char* e = std::getenv("UEVR_AFW_GHOSTING_KEEP_VELOCITY");
+    // Ghosting-fix velocity path. We USED to force camera-only reconstruction (force_reconstruct=1) under
+    // ghosting because the engine VELOCITY carried the OTHER eye's motion — but that was a SYMPTOM of the
+    // ghosting fix forcing the 2nd eye to the PRIMARY projection (set_stereo_pass(eSSP_PRIMARY)). With that
+    // pass swap now skipped under AFW (FFakeStereoRenderingHook keeps the real SECONDARY projection), the
+    // engine renders the 2nd eye's velocity+depth under its OWN per-eye projection, so the per-object velocity
+    // is correct again. Forcing reconstruction was actively HARMFUL: it filled the WHOLE motion-vector buffer
+    // with dense camera-motion AND warped the MOVING character by camera motion -> displaced "ghost" copies at
+    // the wrong screen positions (the blue debug overlay spilled everywhere instead of sitting on the
+    // character). So under ghosting we now use the SAME per-object velocity path as the (working) non-ghosting
+    // case: the warp's motion vectors land on moving objects only. Verified in the MetaXR sim that ghosting-ON
+    // then matches ghosting-OFF. Set UEVR_AFW_GHOSTING_FORCE_RECONSTRUCT=1 to restore the old camera-only
+    // safeguard for A/B testing. The VR_AFWForceReconstruct menu toggle still forces it in EITHER mode.
+    static const bool s_ghosting_force_recon = []() {
+        const char* e = std::getenv("UEVR_AFW_GHOSTING_FORCE_RECONSTRUCT");
         return e != nullptr && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y');
     }();
     const bool ghosting_force_recon =
-        vr->is_ghosting_fix_enabled() && vr->is_using_afr() && !s_ghosting_keep_velocity;
+        s_ghosting_force_recon && vr->is_ghosting_fix_enabled() && vr->is_using_afr();
     constants.force_reconstruct =
         (vr->m_afw_force_reconstruct->value() || ghosting_force_recon) ? 1u : 0u;
+    // Remove the AFR inter-eye disparity from the per-object (encoded) velocity so moving objects stop
+    // flickering between two positions per eye. Default ON; UEVR_AFW_DISPARITY_CORRECT=0 disables for A/B.
+    static const bool s_correct_disparity = []() {
+        const char* e = std::getenv("UEVR_AFW_DISPARITY_CORRECT");
+        return e == nullptr || !(e[0] == '0' || e[0] == 'f' || e[0] == 'F' || e[0] == 'n' || e[0] == 'N');
+    }();
+    constants.correct_disparity = s_correct_disparity ? 1u : 0u;
     // Scale applied to the dense engine (source) velocity before AFW warps with it. The engine field is
     // dense + DLSS-like in direction, but its per-frame magnitude over-shoots what AFW's reprojection can
     // warp cleanly (smears/melts the previous frame). Tune live via UEVR_AFW_SRC_SCALE (default 0.5) to

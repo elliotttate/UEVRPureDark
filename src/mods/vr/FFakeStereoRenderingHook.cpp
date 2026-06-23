@@ -3188,17 +3188,23 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
     }
 
     if (init_options_scene_state != nullptr && !new_scene_state_inserted_this_frame && vr->is_ghosting_fix_enabled() && !known_scene_states.empty() && vr->is_using_afr() && true_index == 1) {
-        // Opt-in depth fix (UEVR_AFW_GHOSTING_KEEP_EYE_PASS): forcing the 2nd eye to PRIMARY makes the engine
-        // render it under the PRIMARY projection, so BOTH eyes collapse onto ONE primary-projection SceneDepth
-        // (verified via a controlled OFF-vs-ON depth dump: ON-eye0 vs ON-eye1 mean|d|=0.0006 vs the real 0.004
-        // stereo disparity, and that buffer matches neither correct eye). Skipping the pass swap — while KEEPING
-        // the scene-state swap below, which is the actual ghosting/temporal separation — lets the 2nd eye keep
-        // its own SECONDARY projection so AFW gets correct per-eye depth. See afw-ghosting-fix-depth-conflict.
+        // AFW depth/velocity fix: forcing the 2nd eye to PRIMARY makes the engine render it under the PRIMARY
+        // projection, so BOTH eyes collapse onto ONE primary-projection SceneDepth (verified via a controlled
+        // OFF-vs-ON depth dump: ON-eye0 vs ON-eye1 mean|d|=0.0006 vs the real 0.004 stereo disparity, and that
+        // buffer matches neither correct eye). In AFW, keep the real eye pass by default while KEEPING the
+        // scene-state swap below, which is the actual ghosting/temporal separation. This preserves the 2nd eye's
+        // SECONDARY projection so AFW's depth reconstruction and motion-vector positions line up. Set
+        // UEVR_AFW_GHOSTING_FORCE_PRIMARY_PASS=1 to restore the old UEVR behavior for A/B testing.
         static const bool s_keep_eye_pass = []() {
             const char* e = std::getenv("UEVR_AFW_GHOSTING_KEEP_EYE_PASS");
             return e != nullptr && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y');
         }();
-        if (!s_keep_eye_pass) {
+        static const bool s_force_primary_eye_pass = []() {
+            const char* e = std::getenv("UEVR_AFW_GHOSTING_FORCE_PRIMARY_PASS");
+            return e != nullptr && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y');
+        }();
+        const bool keep_eye_pass = s_keep_eye_pass || (vr->is_using_afw() && !s_force_primary_eye_pass);
+        if (!keep_eye_pass) {
             init_options->set_stereo_pass(EStereoscopicPass::eSSP_PRIMARY);
         }
 

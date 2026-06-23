@@ -199,7 +199,18 @@ public:
             m_rtpool.activate();
         }
         if (m_config.enable_d3d12bind) {
-            if (renderdoc_present() && !env_bool("UEVR_FRAME_RESOURCES_FORCE_D3D12BIND", false)) {
+            // DEFER the bind-provider install when (a) RenderDoc is present (avoids the session-init abort), OR
+            // (b) UEVR_FRAME_RESOURCES_DEFER_BIND=1. The latter is the AFW-ghosting-warp fix probe: deferring the
+            // install past the ghosting fix's initial 2-view setup measurably removes the warp ghosting (under
+            // RenderDoc, which already defers, the ghosting is faint vs strong in normal mode). If confirmed, this
+            // becomes the default whenever the ghosting fix is on.
+            // Defer the bind-provider install when (a) RenderDoc is present (avoids the session-init abort), or
+            // (b) UEVR_FRAME_RESOURCES_DEFER_BIND=1. NOTE: deferring does NOT fix the ghosting warp — the ghosts
+            // persist (a single clean static frame fooled me). Kept only as the RenderDoc session fix + a probe.
+            const bool want_defer =
+                (renderdoc_present() || env_bool("UEVR_FRAME_RESOURCES_DEFER_BIND", false)) &&
+                !env_bool("UEVR_FRAME_RESOURCES_FORCE_D3D12BIND", false);
+            if (want_defer) {
                 // RenderDoc present: installing the bind provider's hooks DURING the OpenXR session /
                 // view-extension init aborts the session ("FSceneView constructor before view extensions" ->
                 // frames never submit -> black + eye flicker, and every AFW debug view goes dead because the

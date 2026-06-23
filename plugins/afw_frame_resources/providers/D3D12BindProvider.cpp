@@ -1271,16 +1271,15 @@ void D3D12BindProvider::flush(FrameResourceTracker& tracker) {
         }
     }
     take_best_depth(depth_cand);
-    // PER-EYE DEPTH FIX (UEVR_AFW_PER_EYE_DEPTH): under the ghosting fix the engine binds TWO eye-res depth
-    // buffers (one per eye, confirmed via UEVR_AFW_DEPTH_TRACE) but our eye-unaware sticky pins ONE and serves
-    // it to both eyes -> per-eye depth collapses (verified: ON eye0==eye1 0.0008 vs the 0.004 real disparity).
-    // When THIS frame has a fresh eye-res bind (the actually-rendered eye's depth), serve IT and skip the
-    // sticky, so the combine's depthDesc[nEye] gets the right eye's depth (the same way the working ghosting-OFF
-    // path already does). The sticky is still consulted on frames with no fresh eye-res bind. Gated; default off.
+    // PER-EYE DEPTH FIX (UEVR_AFW_PER_EYE_DEPTH, default ON): under the ghosting fix the engine can bind TWO
+    // eye-res depth buffers (one per eye, confirmed via UEVR_AFW_DEPTH_TRACE) but our eye-unaware sticky can pin
+    // ONE and serve it to both eyes -> per-eye depth collapses (verified: ON eye0==eye1 0.0008 vs the 0.004 real
+    // disparity). When THIS frame has a fresh eye-res bind (the actually-rendered eye's depth), serve IT and skip
+    // the sticky, so the combine's depthDesc[nEye] gets the right eye's depth. The sticky is still consulted on
+    // frames with no fresh eye-res bind. Set UEVR_AFW_PER_EYE_DEPTH=0 to restore the old sticky comparison.
     {
         static const bool s_per_eye_depth = []() {
-            const char* e = std::getenv("UEVR_AFW_PER_EYE_DEPTH");
-            return e != nullptr && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y');
+            return env_bool("UEVR_AFW_PER_EYE_DEPTH", true);
         }();
         const bool have_fresh_eyeres = served_depth.present && served_depth.info.resource != nullptr &&
                                        served_depth.info.width >= 1024u && served_depth.info.height >= 1024u;
