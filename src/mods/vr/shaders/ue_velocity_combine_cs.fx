@@ -22,7 +22,7 @@ cbuffer VelocityCombineConstants : register(b0)
     uint ForceReconstruct;  // 1 = ignore the source velocity texture, reconstruct camera motion from depth everywhere
     float SourceScale;      // multiplier applied to the engine (source) velocity; tunes AFW warp strength
     uint VelocityEncoded;   // 1 = velocity is UE-ENCODED RGBA16_UNORM (decode it); 0 = decoded R16G16_FLOAT
-    uint _pad;
+    uint Write3D;           // 1 = also write the 3D velocity to u1 (opt-in via UEVR_AFW_3D_VELOCITY); 0 = skip
 };
 
 uint2 ScaledPixel(uint2 outputPixel, uint2 origin, uint2 extent, uint2 inputSize)
@@ -165,5 +165,8 @@ void VelocityCombineCS(uint3 dispatchThreadId : SV_DispatchThreadID)
     // Depth delta in reverse-Z device space can never exceed [-1,1]; bound any garbage decode (and reject NaN).
     outVz = isfinite(outVz) ? clamp(outVz, -1.0f, 1.0f) : 0.0f;
     OutVelocityCombinedTexture[outputPixel] = outVelocity;                   // .xy -> RG16F (u0), AFW warp
-    OutVelocity3DTexture[outputPixel] = float4(outVelocity, outVz, 0.0f);    // xyz -> RGBA16F (u1), 3D
+    if (Write3D != 0u)                                                       // opt-in 3D output (u1)
+    {
+        OutVelocity3DTexture[outputPixel] = float4(outVelocity, outVz, 0.0f); // xyz -> RGBA16F (u1)
+    }
 }

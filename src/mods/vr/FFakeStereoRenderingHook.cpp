@@ -4,6 +4,7 @@
 #include <winternl.h>
 
 #include <asmjit/asmjit.h>
+#include <cstdlib>
 #include <future>
 
 #include <spdlog/spdlog.h>
@@ -3187,14 +3188,36 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
     }
 
     if (init_options_scene_state != nullptr && !new_scene_state_inserted_this_frame && vr->is_ghosting_fix_enabled() && !known_scene_states.empty() && vr->is_using_afr() && true_index == 1) {
-        init_options->set_stereo_pass(EStereoscopicPass::eSSP_PRIMARY);
+        // Opt-in depth fix (UEVR_AFW_GHOSTING_KEEP_EYE_PASS): forcing the 2nd eye to PRIMARY makes the engine
+        // render it under the PRIMARY projection, so BOTH eyes collapse onto ONE primary-projection SceneDepth
+        // (verified via a controlled OFF-vs-ON depth dump: ON-eye0 vs ON-eye1 mean|d|=0.0006 vs the real 0.004
+        // stereo disparity, and that buffer matches neither correct eye). Skipping the pass swap — while KEEPING
+        // the scene-state swap below, which is the actual ghosting/temporal separation — lets the 2nd eye keep
+        // its own SECONDARY projection so AFW gets correct per-eye depth. See afw-ghosting-fix-depth-conflict.
+        static const bool s_keep_eye_pass = []() {
+            const char* e = std::getenv("UEVR_AFW_GHOSTING_KEEP_EYE_PASS");
+            return e != nullptr && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y');
+        }();
+        if (!s_keep_eye_pass) {
+            init_options->set_stereo_pass(EStereoscopicPass::eSSP_PRIMARY);
+        }
 
-        // Set the scene state to the one that isn't the current one
-        for (auto scene_state : known_scene_states) {
-            if (scene_state != init_options_scene_state) {
-                SPDLOG_INFO_ONCE("Setting scene state to {:x}", (uintptr_t)scene_state);
-                init_options->set_scene_state(scene_state);
-                break;
+        // Diagnostic toggle (UEVR_AFW_GHOSTING_KEEP_SCENE_STATE): skip the scene-state swap to test whether it is
+        // what collapses the per-eye depth (the swapped scene state can route the 2nd eye's render into the 1st
+        // eye's render targets). The view-count-2 above is only TEMPORARY (reverts to 1 once 2 scene states are
+        // learned), so this swap is the persistent per-frame change. See afw-ghosting-fix-depth-conflict.
+        static const bool s_keep_scene_state = []() {
+            const char* e = std::getenv("UEVR_AFW_GHOSTING_KEEP_SCENE_STATE");
+            return e != nullptr && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y');
+        }();
+        if (!s_keep_scene_state) {
+            // Set the scene state to the one that isn't the current one
+            for (auto scene_state : known_scene_states) {
+                if (scene_state != init_options_scene_state) {
+                    SPDLOG_INFO_ONCE("Setting scene state to {:x}", (uintptr_t)scene_state);
+                    init_options->set_scene_state(scene_state);
+                    break;
+                }
             }
         }
     }

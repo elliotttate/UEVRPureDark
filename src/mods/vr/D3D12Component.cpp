@@ -49,7 +49,7 @@ struct AFWVelocityCombineConstants {
     uint32_t force_reconstruct{};
     float source_scale{1.0f};
     uint32_t velocity_encoded{}; // 1 = velocity SRV is the ENCODED RGBA16_UNORM buffer (decode in shader)
-    uint32_t pad{};
+    uint32_t write_3d{};         // 1 = also write the full 3D velocity to u1 (opt-in); 0 = skip (default)
 };
 
 static_assert(sizeof(AFWVelocityCombineConstants) == 36 * sizeof(uint32_t));
@@ -1454,8 +1454,14 @@ bool D3D12Component::combine_ue_velocity_for_afw(
     // Per-eye full-3D velocity target (RGBA16F), the combine's SECOND output (u1). .xy = combined screen motion,
     // .z = depth motion V.z. Kept separate from motionVectorsDesc (which stays RG16F so PDAFW's raw CopyResource
     // is valid). PureDark's 3D reprojection + the "combined Z" debug view read this.
+    // OPT-IN (default OFF via UEVR_AFW_3D_VELOCITY): when off, the combine is byte-identical to pre-3D behavior
+    // (no 2nd UAV allocated -> nothing extra in PDAFW's shared descriptor heap; the shader skips the u1 write).
+    static const bool s_enable_3d = []() {
+        const char* e = std::getenv("UEVR_AFW_3D_VELOCITY");
+        return e != nullptr && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y');
+    }();
     auto& output_3d_desc = m_combined_velocity_3d_desc[eye];
-    {
+    if (s_enable_3d) {
         const auto od = output_desc.pTexture->GetDesc();
         if (output_3d_desc.pTexture == nullptr ||
             output_3d_desc.pTexture->GetDesc().Width != od.Width ||
@@ -1498,8 +1504,10 @@ bool D3D12Component::combine_ue_velocity_for_afw(
             afw_dump_texture_to_disk(device, queue, raw_velocity_desc.pTexture, raw_velocity_desc.initialState, path);
             std::snprintf(path, sizeof(path), "E:\\Github\\UEVRPureDark\\afw_work\\combined_velocity_%d.bin", n);
             afw_dump_texture_to_disk(device, queue, output_desc.pTexture, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, path);
-            std::snprintf(path, sizeof(path), "E:\\Github\\UEVRPureDark\\afw_work\\combined_velocity_3d_%d.bin", n);
-            afw_dump_texture_to_disk(device, queue, output_3d_desc.pTexture, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, path);
+            if (output_3d_desc.pTexture != nullptr) {
+                std::snprintf(path, sizeof(path), "E:\\Github\\UEVRPureDark\\afw_work\\combined_velocity_3d_%d.bin", n);
+                afw_dump_texture_to_disk(device, queue, output_3d_desc.pTexture, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, path);
+            }
             std::snprintf(path, sizeof(path), "E:\\Github\\UEVRPureDark\\afw_work\\depth_%d.bin", n);
             afw_dump_texture_to_disk(device, queue, depth_desc.pTexture, depth_desc.initialState, path);
             SPDLOG_INFO("[VR] AFW VELDUMP #{} wrote raw_velocity_{}/combined_velocity_{}/depth_{} (eye={} {}x{})",
@@ -1556,6 +1564,20 @@ bool D3D12Component::combine_ue_velocity_for_afw(
         s_prev_w2v[ei] = camera_data.srcWorldToViewMatrix;
         s_prev_v2c[ei] = camera_data.srcViewToClipMatrix;
         s_prev_valid[ei] = true;
+
+        // Projection self-consistency trace (UEVR_AFW_PROJ_TRACE): the combine reprojects the engine depth
+        // ASSUMING it was rendered with camera_data.srcViewToClipMatrix. If enabling ghosting shifts the depth
+        // VALUES (which it measurably does, max 0.114->0.052) but this projection does NOT shift to match, the
+        // warp uses a mismatched depth = a REAL bug that gentle motion hides but fast head motion exposes.
+        // Compare fresh vs ghosting: near/far live in P22/P32, the FOV scale in P00/P11.
+        if (std::getenv("UEVR_AFW_PROJ_TRACE") != nullptr) {
+            static int s_pt[2]{0, 0};
+            if ((s_pt[ei]++ % 90) == 0) {
+                const auto& P = camera_data.srcViewToClipMatrix;
+                SPDLOG_INFO("[AFW projtrace] eye={} P00={:.5f} P11={:.5f} P22={:.6f} P32={:.6f} P23={:.5f} P33={:.5f}",
+                            (int)eye, P[0][0], P[1][1], P[2][2], P[3][2], P[2][3], P[3][3]);
+            }
+        }
 
         // ---- Reconstruction reliability diagnostic ----------------------------------------------
         // The depth-reconstruction fallback (which must fill the guard-band borders AND cover the case
@@ -1619,7 +1641,22 @@ bool D3D12Component::combine_ue_velocity_for_afw(
     // 0 = hybrid: use the engine's per-object velocity for moving objects, reconstruct camera motion for
     // static geometry (so the character reprojects onto itself AND head motion still warps the scene).
     // 1 = camera-only everywhere (objects ghost). Live toggle for comparison.
-    constants.force_reconstruct = vr->m_afw_force_reconstruct->value() ? 1u : 0u;
+    // Ghosting-fix velocity safeguard. The ghosting fix leaves the DEPTH untouched (proven byte-identical fresh
+    // vs ghosting, see afw-ghosting-fix-depth-conflict), but the engine VELOCITY it produces carries the OTHER
+    // eye's motion (confirmed by PureDark). The per-object velocity override would then warp moving objects in
+    // the wrong direction under ghosting. The depth+camera reconstruction (reconVel) is proven correct, so when
+    // ghosting is active drive the warp from reconstruction alone — moving objects warp by camera motion (clean)
+    // instead of contaminated velocity (wrong); static geometry is unaffected (reconVel already owns it). Opt
+    // out with UEVR_AFW_GHOSTING_KEEP_VELOCITY=1 (e.g. once PureDark's per-eye velocity shader lands). Normal
+    // (non-ghosting) mode keeps the per-object velocity path unchanged.
+    static const bool s_ghosting_keep_velocity = []() {
+        const char* e = std::getenv("UEVR_AFW_GHOSTING_KEEP_VELOCITY");
+        return e != nullptr && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y');
+    }();
+    const bool ghosting_force_recon =
+        vr->is_ghosting_fix_enabled() && vr->is_using_afr() && !s_ghosting_keep_velocity;
+    constants.force_reconstruct =
+        (vr->m_afw_force_reconstruct->value() || ghosting_force_recon) ? 1u : 0u;
     // Scale applied to the dense engine (source) velocity before AFW warps with it. The engine field is
     // dense + DLSS-like in direction, but its per-frame magnitude over-shoots what AFW's reprojection can
     // warp cleanly (smears/melts the previous frame). Tune live via UEVR_AFW_SRC_SCALE (default 0.5) to
@@ -1637,6 +1674,7 @@ bool D3D12Component::combine_ue_velocity_for_afw(
     // and uses the `EncodedVelocity.x > 0` written flag (byte-identical to DLSS); the RG16F variant is used raw.
     constants.velocity_encoded =
         (velocity_resource_desc.Format == DXGI_FORMAT_R16G16B16A16_UNORM) ? 1u : 0u;
+    constants.write_3d = s_enable_3d ? 1u : 0u;
 
     if (constants.output_size[0] == 0 || constants.output_size[1] == 0 ||
         constants.velocity_size[0] == 0 || constants.velocity_size[1] == 0 ||
@@ -1697,7 +1735,9 @@ bool D3D12Component::combine_ue_velocity_for_afw(
     command_list->SetComputeRootDescriptorTable(2, output_desc.unorderedAccessViewHandle);
     command_list->SetComputeRoot32BitConstants(
         3, sizeof(AFWVelocityCombineConstants) / sizeof(uint32_t), &constants, 0);
-    command_list->SetComputeRootDescriptorTable(4, output_3d_desc.unorderedAccessViewHandle);
+    // u1: the real 3D target when enabled; else a dummy (u0's UAV). The shader skips the u1 write when Write3D==0.
+    command_list->SetComputeRootDescriptorTable(4, s_enable_3d ? output_3d_desc.unorderedAccessViewHandle
+                                                               : output_desc.unorderedAccessViewHandle);
 
     auto velocity_state = raw_velocity_desc.initialState;
     if (velocity_state == D3D12_RESOURCE_STATE_COMMON) {
@@ -1710,17 +1750,21 @@ bool D3D12Component::combine_ue_velocity_for_afw(
     }
     afw_transition_resource(command_list, output_desc.pTexture, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    afw_transition_resource(command_list, output_3d_desc.pTexture, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
-                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (s_enable_3d) {
+        afw_transition_resource(command_list, output_3d_desc.pTexture, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
 
     command_list->Dispatch((constants.output_size[0] + 7) / 8, (constants.output_size[1] + 7) / 8, 1);
 
     afw_uav_barrier(command_list, output_desc.pTexture);
-    afw_uav_barrier(command_list, output_3d_desc.pTexture);
     afw_transition_resource(command_list, output_desc.pTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                             D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
-    afw_transition_resource(command_list, output_3d_desc.pTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                            D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+    if (s_enable_3d) {
+        afw_uav_barrier(command_list, output_3d_desc.pTexture);
+        afw_transition_resource(command_list, output_3d_desc.pTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+    }
     if (transition_velocity) {
         afw_transition_resource(command_list, raw_velocity_desc.pTexture,
                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, velocity_state);
@@ -1809,6 +1853,9 @@ void D3D12Component::render_debug_view(VR* vr, ID3D12GraphicsCommandList* comman
     case 9:  input = &m_raw_velocity_desc[eye];         shader_mode = 7; scale = 2000.0f; break; // raw source velocity Z (depth motion)
     case 10: input = &m_combined_velocity_3d_desc[eye]; shader_mode = 8; scale = 2000.0f; break; // combined velocity Z (depth motion)
     default: return;
+    }
+    if (input == nullptr || input->pTexture == nullptr) {
+        return; // e.g. combined-Z (mode 10) when the 3D buffer is disabled (UEVR_AFW_3D_VELOCITY off)
     }
     // Live magnitude knob for the velocity false-color (so the gradient can be dialed without rebuilds).
     if (view_mode != 3) {

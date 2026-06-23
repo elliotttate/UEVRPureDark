@@ -56,6 +56,20 @@ bool env_bool(const char* name, bool def) {
     return std::atoi(v) != 0;
 }
 
+// RenderDoc replaces the D3D12 device + command-list vtables with its own capture wrappers.
+// D3D12BindProvider inline-hooks those exact vtable slots (CreateRTV/DSV, ResourceBarrier,
+// OMSetRenderTargets) AND, from inside the ResourceBarrier detour, injects its own GPU work
+// (CreateCommittedResource + CopyResource + extra barriers) to snapshot velocity. Doing that to
+// RenderDoc's wrappers — patching code inside renderdoc.dll and re-entering those wrappers from
+// within a wrapped call while feeding unexpected commands into the capture stream — hangs the game
+// the moment RenderDoc starts a frame capture. (This is exactly why capture worked before the
+// resource tracker was merged.) So when RenderDoc is loaded, skip the bind provider; capture then
+// behaves like it did pre-plugin. The read-only rtpool/ngx providers stay active.
+// Override with UEVR_FRAME_RESOURCES_FORCE_D3D12BIND=1 if you explicitly want the hooks under RenderDoc.
+bool renderdoc_present() {
+    return GetModuleHandleW(L"renderdoc.dll") != nullptr;
+}
+
 struct Config {
     bool master{true};
     int log_level{1};
@@ -185,7 +199,22 @@ public:
             m_rtpool.activate();
         }
         if (m_config.enable_d3d12bind) {
-            m_d3d12bind.install(device);
+            if (renderdoc_present() && !env_bool("UEVR_FRAME_RESOURCES_FORCE_D3D12BIND", false)) {
+                // RenderDoc present: installing the bind provider's hooks DURING the OpenXR session /
+                // view-extension init aborts the session ("FSceneView constructor before view extensions" ->
+                // frames never submit -> black + eye flicker, and every AFW debug view goes dead because the
+                // combine is starved of depth). The provider's CAPTURE works fine under RenderDoc once running
+                // (verified via FORCE_D3D12BIND: it observed depth+velocity); only installing mid-init is fatal.
+                // So DEFER the install until the session is up + presenting (handled in on_present) instead of
+                // skipping it (which is what left AFW dead under capture). Override with
+                // UEVR_FRAME_RESOURCES_FORCE_D3D12BIND=1 to install immediately (aborts the session).
+                m_rdc_defer_bind_pending = true;
+                m_rdc_defer_frames = 0;
+                afw_fr::log_warn("RenderDoc detected: DEFERRING D3D12 bind provider install until the VR "
+                                 "session is established (keeps AFW warp + debug views working under capture).");
+            } else {
+                m_d3d12bind.install(device);
+            }
         }
         if (m_config.enable_dlss_observer) {
             m_ngx.try_enable();
@@ -271,6 +300,25 @@ public:
 
         ++m_frame;
         tracker.begin_frame(m_frame);
+
+        // RenderDoc deferred bind-provider install: now that the game is presenting, the OpenXR session is up
+        // and submitting frames, so installing the bind provider's hooks no longer aborts session init. Wait a
+        // few seconds of presents to be safe, then install once. From then on the provider feeds depth/velocity
+        // to the AFW combine -> the warp runs (no flicker) and the debug views light up, all with RenderDoc
+        // attached. If this re-introduces the hang, the conflict is in the ongoing hooks (not just install).
+        if (m_rdc_defer_bind_pending) {
+            if (++m_rdc_defer_frames >= 240u) {
+                auto& api = uevr::API::get();
+                const auto* renderer = api->param()->renderer;
+                if (renderer != nullptr && renderer->renderer_type == UEVR_RENDERER_D3D12 &&
+                    renderer->device != nullptr) {
+                    m_d3d12bind.install(static_cast<ID3D12Device*>(renderer->device));
+                    m_rdc_defer_bind_pending = false;
+                    afw_fr::log_info("RenderDoc deferred install: D3D12 bind provider installed at frame %u "
+                                     "(session established)", m_frame);
+                }
+            }
+        }
 
         if (m_config.enable_rtpool) {
             m_rtpool.update(tracker);
@@ -365,6 +413,8 @@ private:
     bool m_force_velocity_pending{false};
     bool m_force_rdg_pool_pending{false};
     bool m_reinstall_pending{false};
+    bool m_rdc_defer_bind_pending{false};
+    uint32_t m_rdc_defer_frames{0};
     afw_fr::RenderTargetPoolProvider m_rtpool;
     afw_fr::D3D12BindProvider m_d3d12bind;
     afw_fr::NgxDlssProvider m_ngx;

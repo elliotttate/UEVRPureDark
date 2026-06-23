@@ -15,6 +15,10 @@
 #include <mutex>
 #include <unordered_map>
 
+// RenderDoc API — used only to query IsFrameCapturing() so we can suspend our injected CopyResource for the
+// exact frame RenderDoc is serializing (see renderdoc_is_capturing / snapshot_velocity_resource_locked).
+#include "../../../dependencies/vendor/renderdoc/renderdoc_app.h"
+
 namespace afw_fr {
 namespace {
 
@@ -487,10 +491,39 @@ void command_list_transition(ID3D12GraphicsCommandList* list, ID3D12Resource* re
     orig(list, 1, &barrier);
 }
 
+// True only while RenderDoc is actively capturing this frame (lazy-loaded; false when renderdoc.dll absent).
+// During a capture RenderDoc serializes the engine command list; injecting our snapshot CopyResource onto it
+// then stalls RenderDoc's capture thread (the original reason the bind provider was disabled wholesale under
+// RenderDoc). We instead suspend just that injected copy for the captured frame.
+bool renderdoc_is_capturing() {
+    static RENDERDOC_API_1_7_0* s_api = nullptr;
+    static bool s_resolved = false;
+    if (!s_resolved) {
+        s_resolved = true;
+        if (HMODULE mod = GetModuleHandleW(L"renderdoc.dll")) {
+            if (auto get_api = reinterpret_cast<pRENDERDOC_GetAPI>(GetProcAddress(mod, "RENDERDOC_GetAPI"))) {
+                void* api_ptr = nullptr;
+                if (get_api(eRENDERDOC_API_Version_1_7_0, &api_ptr) == 1) {
+                    s_api = static_cast<RENDERDOC_API_1_7_0*>(api_ptr);
+                }
+            }
+        }
+    }
+    return s_api != nullptr && s_api->IsFrameCapturing() != 0;
+}
+
 void snapshot_velocity_resource_locked(ID3D12GraphicsCommandList* list, const D3D12ViewInfo& info,
                                        D3D12_RESOURCE_STATES current_state, uint32_t current_frame,
                                        const char* source) {
     if (!velocity_snapshot_enabled() || list == nullptr || info.resource == nullptr) {
+        return;
+    }
+
+    // Suspend the injected copy while RenderDoc is capturing this frame: our CopyResource on the engine list
+    // would stall RenderDoc's in-flight capture. The captured frame keeps the previous stable snapshot, so the
+    // AFW combine still runs; non-capture frames are unaffected. This lets AFW stay live under RenderDoc AND
+    // lets frame captures complete (instead of the old all-or-nothing: provider-off = capture-only, no AFW).
+    if (renderdoc_is_capturing()) {
         return;
     }
 
@@ -1221,8 +1254,40 @@ void D3D12BindProvider::flush(FrameResourceTracker& tracker) {
         served_depth = option;
         option = {};
     };
+    // A-vs-B diagnostic (UEVR_AFW_DEPTH_TRACE): log the FRESH per-frame depth bind the engine made this
+    // frame. If fresh_ptr alternates between two eye-res resources -> engine renders per-eye (A, fix in our
+    // provider); if it's one resource every frame (or mostly sticky) -> ghosting fix renders one eye (B,
+    // fix in its render cadence). See afw-ghosting-fix-depth-conflict.
+    {
+        static int s_depthtrace = 0;
+        if (std::getenv("UEVR_AFW_DEPTH_TRACE") != nullptr && s_depthtrace++ < 240) {
+            log_info("[depthtrace] f=%u freshBind=%s fresh_ptr=0x%p %ux%u sticky_ptr=0x%p",
+                     current_frame,
+                     (depth_cand.present && depth_cand.info.resource != nullptr) ? "Y" : "N",
+                     depth_cand.present ? (void*)depth_cand.info.resource : nullptr,
+                     depth_cand.present ? depth_cand.info.width : 0u,
+                     depth_cand.present ? depth_cand.info.height : 0u,
+                     sticky_depth_cand.present ? (void*)sticky_depth_cand.info.resource : nullptr);
+        }
+    }
     take_best_depth(depth_cand);
-    take_best_depth(sticky_depth_cand);
+    // PER-EYE DEPTH FIX (UEVR_AFW_PER_EYE_DEPTH): under the ghosting fix the engine binds TWO eye-res depth
+    // buffers (one per eye, confirmed via UEVR_AFW_DEPTH_TRACE) but our eye-unaware sticky pins ONE and serves
+    // it to both eyes -> per-eye depth collapses (verified: ON eye0==eye1 0.0008 vs the 0.004 real disparity).
+    // When THIS frame has a fresh eye-res bind (the actually-rendered eye's depth), serve IT and skip the
+    // sticky, so the combine's depthDesc[nEye] gets the right eye's depth (the same way the working ghosting-OFF
+    // path already does). The sticky is still consulted on frames with no fresh eye-res bind. Gated; default off.
+    {
+        static const bool s_per_eye_depth = []() {
+            const char* e = std::getenv("UEVR_AFW_PER_EYE_DEPTH");
+            return e != nullptr && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y');
+        }();
+        const bool have_fresh_eyeres = served_depth.present && served_depth.info.resource != nullptr &&
+                                       served_depth.info.width >= 1024u && served_depth.info.height >= 1024u;
+        if (!s_per_eye_depth || !have_fresh_eyeres) {
+            take_best_depth(sticky_depth_cand);
+        }
+    }
     if (depth_cand.info.resource != nullptr) depth_cand.info.resource->Release();
     if (sticky_depth_cand.info.resource != nullptr) sticky_depth_cand.info.resource->Release();
 
