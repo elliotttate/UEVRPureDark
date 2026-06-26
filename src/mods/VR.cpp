@@ -64,11 +64,22 @@ NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_EvaluateFeature(
         InParameters->Get(NVSDK_NGX_Parameter_Depth, &depth);
         InParameters->Get(NVSDK_NGX_Parameter_MotionVectors, &motionVectors);
         InParameters->Get(NVSDK_NGX_Parameter_Output, &output);
-        InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &vr->mvScale[0]);
-        InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &vr->mvScale[1]);
+        const NVSDK_NGX_Result s_mvsx_rc = InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &vr->mvScale[0]);
+        const NVSDK_NGX_Result s_mvsy_rc = InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &vr->mvScale[1]);
         // Diagnostic: stash the engine MV DLSS is fed so the combine's VELDUMP can dump it for a same-frame
         // comparison against our combine output (afw_work\dlss_mv_N.bin vs combined_velocity_N.bin).
         vr->afw_dlss_mv_capture = motionVectors;
+        // MV-scale hunt: BMW's engine MV samples ~470px for a gentle pan (>> physical motion). Log whether BMW
+        // even sets MV_Scale (rc==1 == NVSDK_NGX_Result_Success) and the MV/depth resource dims, to find the
+        // unit/scale we're missing (mvScale stays at the {1,1} init when the Get fails).
+        {
+            unsigned int s_mvw = 0, s_mvh = 0; int s_mvf = 0;
+            if (motionVectors) { const auto d = motionVectors->GetDesc(); s_mvw = (unsigned int)d.Width; s_mvh = d.Height; s_mvf = (int)d.Format; }
+            unsigned int s_dw = 0, s_dh = 0;
+            if (depth) { const auto d = depth->GetDesc(); s_dw = (unsigned int)d.Width; s_dh = d.Height; }
+            SPDLOG_INFO_EVERY_N_SEC(2, "[NGX-MV] MV_Scale rc=({},{}) val=({:.5f},{:.5f}) mvWH=({}x{} fmt={}) depthWH=({}x{})",
+                (int)s_mvsx_rc, (int)s_mvsy_rc, vr->mvScale[0], vr->mvScale[1], s_mvw, s_mvh, s_mvf, s_dw, s_dh);
+        }
         // When the modular frame-resource provider is enabled (UEVR_AFW_FRAME_RESOURCES=1) we want AFW
         // to use OUR depth/velocity + reconstruct-from-depth combine, NOT the buffers DLSS happens to be
         // evaluating with. Grabbing them here (and pre-copying into depthDesc/mvDesc) would set

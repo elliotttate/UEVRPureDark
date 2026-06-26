@@ -274,6 +274,10 @@ void log_provider_copy(bool velocity, const UEVR_FrameResourceView& view) {
 }
 
 namespace vrmod {
+// Forward-declared so on_frame's engine-MV VELDUMP can call it (definition is below, after on_frame).
+static void afw_dump_texture_to_disk(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Resource* tex,
+                                     D3D12_RESOURCE_STATES before_state, const char* path);
+
 vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     if (m_force_reset || m_last_afr_state != vr->is_using_afr()) {
         if (!setup()) {
@@ -948,6 +952,33 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                                 static_cast<int>(nEye),
                                 params.MotionVectorsType == Normal ? "Normal" : "FromOtherEye",
                                 combined_velocity ? 1 : 0, params.InMotionScale[0], params.InMotionScale[1]);
+        // At-rest engine-MV hunt: dump the engine MV (the DLSS MotionVectors the NGX hook grabbed) AND the
+        // motionVectorsDesc the warp + debug-view actually read, in the ENGINE-MV path (where the combine's
+        // VELDUMP never runs). Trigger: UEVR_AFW_VELDUMP=1 + afw_work\DUMP_NOW. Tells us whether the engine MV
+        // is ~0 at rest (so the red debug view is a viz artifact) or a real constant bias.
+        if (std::getenv("UEVR_AFW_VELDUMP") != nullptr) {
+            static const char* const s_eng_trigger = "E:\\Github\\UEVRPureDark\\afw_work\\DUMP_NOW";
+            if (GetFileAttributesA(s_eng_trigger) != INVALID_FILE_ATTRIBUTES) {
+                DeleteFileA(s_eng_trigger);
+                static int s_eng_idx = 0; const int en = s_eng_idx++;
+                auto* eq = g_framework->get_d3d12_hook()->get_command_queue();
+                ID3D12Device* edev = nullptr;
+                if (vr->motionVectorsDesc[nEye].pTexture) vr->motionVectorsDesc[nEye].pTexture->GetDevice(IID_PPV_ARGS(&edev));
+                char ep[300];
+                if (edev != nullptr && eq != nullptr) {
+                    if (vr->afw_dlss_mv_capture != nullptr) {
+                        std::snprintf(ep, sizeof(ep), "E:\\Github\\UEVRPureDark\\afw_work\\eng_dlss_mv_%d.bin", en);
+                        afw_dump_texture_to_disk(edev, eq, vr->afw_dlss_mv_capture, D3D12_RESOURCE_STATE_COMMON, ep);
+                    }
+                    if (vr->motionVectorsDesc[nEye].pTexture != nullptr) {
+                        std::snprintf(ep, sizeof(ep), "E:\\Github\\UEVRPureDark\\afw_work\\eng_mvdesc_%d.bin", en);
+                        afw_dump_texture_to_disk(edev, eq, vr->motionVectorsDesc[nEye].pTexture, vr->motionVectorsDesc[nEye].initialState, ep);
+                    }
+                    SPDLOG_INFO("[VR] ENGINE-MV DUMP #{} eye={} combinedVel={}", en, static_cast<int>(nEye), combined_velocity ? 1 : 0);
+                }
+                if (edev != nullptr) edev->Release();
+            }
+        }
         params.Mode = (FrameWarpMode)vr->m_framewarp_mode->value();
         params.EyeIndex = nEye;
         params.ClearBeforeWarping = vr->m_clear_before_framewarp->value();

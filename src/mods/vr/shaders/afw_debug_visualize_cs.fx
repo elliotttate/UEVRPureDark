@@ -111,7 +111,21 @@ void DebugVisualizeCS(uint3 tid : SV_DispatchThreadID)
         // Motion vectors: hue = direction, brightness = magnitude (tanh rolloff so the wide AFW
         // pixel-space range stays readable). Near-zero = dark grey. Both Mode 0 (combined pixels) and
         // Mode 2 (source) read raw.xy directly.
-        const float2 v = raw.xy;
+        float2 v = raw.xy;
+        // AFW renders one eye per frame, so the ENGINE MV (Mode 0 = combined) is computed relative to the
+        // PREVIOUS frame = the OTHER eye, baking a large UNIFORM inter-eye stereo/projection offset into it
+        // (~+/-480px, opposite sign per eye). That otherwise paints this whole view solid red/cyan even at
+        // rest. Subtract a 4-corner (far-background) reference -- which is ~= that uniform offset -- so the
+        // view shows the real temporal + parallax structure (near-grey at rest). Mode 2 (raw source
+        // velocity) is already 0-at-rest, so leave it untouched.
+        if (Mode == 0)
+        {
+            const int2 hi = int2(InputSize) - int2(5, 5);
+            const float2 baseline = 0.25f * (
+                InputTex.Load(int3(4, 4, 0)).xy + InputTex.Load(int3(hi.x, 4, 0)).xy +
+                InputTex.Load(int3(4, hi.y, 0)).xy + InputTex.Load(int3(hi.x, hi.y, 0)).xy);
+            v -= baseline;
+        }
         const float val = tanh(length(v) * Scale);
         if (val < 0.02f)
         {
