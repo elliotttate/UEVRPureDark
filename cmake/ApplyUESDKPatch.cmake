@@ -35,18 +35,18 @@ function(_uevr_apply_uesdk_patch _label _patch _sentinel_file _failure_hint)
 
     # Already applied? A clean reverse-apply check means the fix is present.
     execute_process(
-        COMMAND "${GIT_EXECUTABLE}" -C "${_uesdk_dir}" apply --reverse --check "${_patch}"
+        COMMAND "${GIT_EXECUTABLE}" -C "${_uesdk_dir}" apply --reverse --check --ignore-whitespace "${_patch}"
         RESULT_VARIABLE _uesdk_rev_rc OUTPUT_QUIET ERROR_QUIET)
 
     if(_uesdk_rev_rc EQUAL 0)
         message(STATUS "UESDK ${_label} patch: already applied")
     else()
         execute_process(
-            COMMAND "${GIT_EXECUTABLE}" -C "${_uesdk_dir}" apply --check "${_patch}"
+            COMMAND "${GIT_EXECUTABLE}" -C "${_uesdk_dir}" apply --check --ignore-whitespace "${_patch}"
             RESULT_VARIABLE _uesdk_fwd_rc OUTPUT_QUIET ERROR_QUIET)
         if(_uesdk_fwd_rc EQUAL 0)
             execute_process(
-                COMMAND "${GIT_EXECUTABLE}" -C "${_uesdk_dir}" apply "${_patch}"
+                COMMAND "${GIT_EXECUTABLE}" -C "${_uesdk_dir}" apply --ignore-whitespace "${_patch}"
                 RESULT_VARIABLE _uesdk_ap_rc)
             if(_uesdk_ap_rc EQUAL 0)
                 message(STATUS "UESDK ${_label} patch: APPLIED")
