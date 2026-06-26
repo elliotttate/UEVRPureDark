@@ -56,7 +56,9 @@ struct AFWVelocityCombineConstants {
     // second position = the 2-position-per-eye flicker). Subtracting the disparity leaves true same-eye motion.
     float clip_to_other_clip[16]{};
     uint32_t correct_disparity{}; // 1 = subtract the inter-eye disparity from the per-object (encoded) velocity
-    uint32_t _pad[3]{};
+    uint32_t write_depth_eye{};   // 1 = also write the resampled eye-res depth to u2 (so PDAFW warps with a
+                                  // depth that matches the eye resolution instead of the smaller DRS source)
+    uint32_t _pad[2]{};
 };
 
 static_assert(sizeof(AFWVelocityCombineConstants) == 56 * sizeof(uint32_t));
@@ -706,10 +708,31 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         if (eye_width == 0 || eye_height == 0) {
             return true;
         }
-        const bool ok = r.view.width >= eye_width && r.view.height >= eye_height;
+        const uint32_t w = r.view.width, h = r.view.height;
+        if (w == 0 || h == 0) {
+            return false;
+        }
+        // Match the eye by ASPECT RATIO within a sane size band, NOT by ">= eye". Two failure modes the
+        // old ">= eye" check caused on DRS/TSR titles (e.g. Black Myth: Wukong, which renders the scene at
+        // ~67% then upscales the eye color):
+        //   1) it REJECTED the real scene depth/velocity (1124x1176, a proportional downscale of the eye)
+        //      -> AFW never consumed our provider buffers.
+        //   2) it ACCEPTED anything larger than the eye, including a 10240x2048 virtual-shadow-map atlas
+        //      that the depth scorer occasionally hands us -> copying that as depth FAULTS the device and
+        //      crashes the game on the gameplay transition.
+        // The combine resamples a smaller source into the eye-sized output via its ScaledPixel map, so a
+        // proportional sub-eye buffer is correct to accept; an off-aspect/oversized buffer never is.
+        const double eye_aspect = static_cast<double>(eye_width) / static_cast<double>(eye_height);
+        const double buf_aspect = static_cast<double>(w) / static_cast<double>(h);
+        const double aspect_err = (buf_aspect > eye_aspect ? buf_aspect - eye_aspect : eye_aspect - buf_aspect);
+        const bool aspect_ok = aspect_err <= 0.10 * eye_aspect; // within 10% of the eye aspect ratio
+        const double fx = static_cast<double>(w) / static_cast<double>(eye_width);
+        const double fy = static_cast<double>(h) / static_cast<double>(eye_height);
+        const bool size_ok = fx >= 0.40 && fy >= 0.40 && fx <= 2.0 && fy <= 2.0; // 40%..200% of eye
+        const bool ok = aspect_ok && size_ok;
         if (!ok) {
-            SPDLOG_INFO_EVERY_N_SEC(3, "[AFWFrameResources] rejecting non-eye-resolution provider buffer {}x{} (eye {}x{})",
-                                    r.view.width, r.view.height, eye_width, eye_height);
+            SPDLOG_INFO_EVERY_N_SEC(3, "[AFWFrameResources] rejecting non-eye-shaped provider buffer {}x{} (eye {}x{}, aspectErr={:.3f} fx={:.2f} fy={:.2f})",
+                                    w, h, eye_width, eye_height, aspect_err, fx, fy);
         }
         return ok;
     };
@@ -888,7 +911,11 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         }
 
         s_CurrentEyeFrameBuffer.color = eyeFrameBuffer.color;
-        s_CurrentEyeFrameBuffer.depth = vr->depthDesc[nEye];
+        // Prefer the combine's eye-resolution depth (u2) so PDAFW warps with a depth that matches its eye
+        // color + MV; fall back to the raw DRS-res provider depth if the combine didn't run this frame.
+        s_CurrentEyeFrameBuffer.depth = (combined_velocity && m_afw_depth_eye_desc[nEye].pTexture != nullptr)
+            ? m_afw_depth_eye_desc[nEye]
+            : vr->depthDesc[nEye];
         s_CurrentEyeFrameBuffer.motionVectors = vr->motionVectorsDesc[nEye];
         //if (vr->mDebug2) {
         //    vr->d3d12Renderer->Clear(cmdList, eyeFrameBuffer.depth, black);
@@ -917,6 +944,10 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         params.MotionVectorsType = (vr->is_fix_dlss() || combined_velocity) ? Normal : FromOtherEye;
         params.InMotionScale[0] = combined_velocity ? afw_mv_scale : vr->mvScale[0];
         params.InMotionScale[1] = combined_velocity ? afw_mv_scale : vr->mvScale[1];
+        SPDLOG_INFO_EVERY_N_SEC(2, "[VR] AFW params eye={} mvType={} combinedVel={} mvScale=({:.4f},{:.4f})",
+                                static_cast<int>(nEye),
+                                params.MotionVectorsType == Normal ? "Normal" : "FromOtherEye",
+                                combined_velocity ? 1 : 0, params.InMotionScale[0], params.InMotionScale[1]);
         params.Mode = (FrameWarpMode)vr->m_framewarp_mode->value();
         params.EyeIndex = nEye;
         params.ClearBeforeWarping = vr->m_clear_before_framewarp->value();
@@ -1313,7 +1344,14 @@ bool D3D12Component::setup_velocity_combine_pipeline(ID3D12Device* device) {
     output_uav_3d_range.RegisterSpace = 0;
     output_uav_3d_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-    D3D12_ROOT_PARAMETER root_parameters[5]{};
+    D3D12_DESCRIPTOR_RANGE output_uav_depth_range{};
+    output_uav_depth_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    output_uav_depth_range.NumDescriptors = 1;
+    output_uav_depth_range.BaseShaderRegister = 2; // register u2 (resampled eye-res depth for PDAFW)
+    output_uav_depth_range.RegisterSpace = 0;
+    output_uav_depth_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_ROOT_PARAMETER root_parameters[6]{};
     root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     root_parameters[0].DescriptorTable.NumDescriptorRanges = 1;
     root_parameters[0].DescriptorTable.pDescriptorRanges = &velocity_srv_range;
@@ -1339,6 +1377,11 @@ bool D3D12Component::setup_velocity_combine_pipeline(ID3D12Device* device) {
     root_parameters[4].DescriptorTable.NumDescriptorRanges = 1;
     root_parameters[4].DescriptorTable.pDescriptorRanges = &output_uav_3d_range;
     root_parameters[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    root_parameters[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    root_parameters[5].DescriptorTable.NumDescriptorRanges = 1;
+    root_parameters[5].DescriptorTable.pDescriptorRanges = &output_uav_depth_range;
+    root_parameters[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_ROOT_SIGNATURE_DESC root_signature_desc{};
     root_signature_desc.NumParameters = sizeof(root_parameters) / sizeof(root_parameters[0]);
@@ -1493,6 +1536,42 @@ bool D3D12Component::combine_ue_velocity_for_afw(
         }
     }
 
+    // Eye-resolution resampled depth (u2): the provider depth is the game's DRS render-scale resolution
+    // (e.g. 1124x1176) while PDAFW warps the eye at full resolution (e.g. 1680x1760). Hand PDAFW the raw
+    // DRS depth and its depth-driven reprojection mis-samples (the "broken warp" — RenderDoc confirmed our
+    // depth was 1124x1176 D32S8 vs the eye's 1680x1760). The combine already resamples the depth per OUTPUT
+    // pixel (ScaledPixel + 3x3 dilation) for the MV, so it also writes that eye-res depth to u2 (R32_FLOAT,
+    // matching PDAFW's m_*EyeDesc.depth). Default ON; UEVR_AFW_DEPTH_EYE_RESCALE=0 reverts to the raw depth.
+    static const bool s_enable_depth_eye = []() {
+        const char* e = std::getenv("UEVR_AFW_DEPTH_EYE_RESCALE");
+        return e == nullptr || !(e[0] == '0' || e[0] == 'f' || e[0] == 'F' || e[0] == 'n' || e[0] == 'N');
+    }();
+    auto& depth_eye_desc = m_afw_depth_eye_desc[eye];
+    if (s_enable_depth_eye) {
+        const auto od = output_desc.pTexture->GetDesc();
+        if (depth_eye_desc.pTexture == nullptr ||
+            depth_eye_desc.pTexture->GetDesc().Width != od.Width ||
+            depth_eye_desc.pTexture->GetDesc().Height != od.Height) {
+            if (!vr->d3d12Renderer->CreateTexture(static_cast<int>(od.Width), static_cast<int>(od.Height),
+                    DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, depth_eye_desc, true)) {
+                SPDLOG_ERROR_EVERY_N_SEC(1, "[VR] AFW failed to create eye-res depth target");
+                return false;
+            }
+            depth_eye_desc.pTexture->SetName(L"UEVR AFW depth eye-res");
+            depth_eye_desc.unorderedAccessViewHandle.ptr = 0;
+            depth_eye_desc.uavPos = -1;
+        }
+        if (depth_eye_desc.unorderedAccessViewHandle.ptr == 0 || depth_eye_desc.uavPos < 0) {
+            const int uav_pos = vr->d3d12Renderer->CreateUAV(depth_eye_desc.pTexture);
+            if (uav_pos < 0) {
+                SPDLOG_ERROR_EVERY_N_SEC(1, "[VR] AFW failed to create eye-res depth UAV");
+                return false;
+            }
+            depth_eye_desc.uavPos = uav_pos;
+            depth_eye_desc.unorderedAccessViewHandle = vr->d3d12Renderer->GetGPUDescriptorHandle(uav_pos);
+        }
+    }
+
     // DIAGNOSTIC: ON-DEMAND dump of the ACTUAL velocity/depth/combined bytes. Gated by env
     // UEVR_AFW_VELDUMP=1. Create the trigger file afw_work\DUMP_NOW (e.g. WHILE driving the pawn so the
     // buffers hold a motion frame) and the next combine call dumps raw_velocity_<N>.bin /
@@ -1517,6 +1596,17 @@ bool D3D12Component::combine_ue_velocity_for_afw(
             }
             std::snprintf(path, sizeof(path), "E:\\Github\\UEVRPureDark\\afw_work\\depth_%d.bin", n);
             afw_dump_texture_to_disk(device, queue, depth_desc.pTexture, depth_desc.initialState, path);
+            // Also dump the DECODED engine MV that DLSS itself is fed (captured by the NGX hook this frame),
+            // so we can compare DLSS's ground-truth MV against our combine output in the SAME frame.
+            if (vr->afw_dlss_mv_capture != nullptr) {
+                std::snprintf(path, sizeof(path), "E:\\Github\\UEVRPureDark\\afw_work\\dlss_mv_%d.bin", n);
+                afw_dump_texture_to_disk(device, queue, vr->afw_dlss_mv_capture,
+                                         D3D12_RESOURCE_STATE_COMMON, path);
+                SPDLOG_INFO("[VR] AFW VELDUMP #{} dlss_mv {}x{} fmt={}", n,
+                            static_cast<uint32_t>(vr->afw_dlss_mv_capture->GetDesc().Width),
+                            vr->afw_dlss_mv_capture->GetDesc().Height,
+                            static_cast<int>(vr->afw_dlss_mv_capture->GetDesc().Format));
+            }
             SPDLOG_INFO("[VR] AFW VELDUMP #{} wrote raw_velocity_{}/combined_velocity_{}/depth_{} (eye={} {}x{})",
                         n, n, n, n, static_cast<int>(eye),
                         static_cast<uint32_t>(output_desc.pTexture->GetDesc().Width), output_desc.pTexture->GetDesc().Height);
@@ -1718,6 +1808,7 @@ bool D3D12Component::combine_ue_velocity_for_afw(
     constants.velocity_encoded =
         (velocity_resource_desc.Format == DXGI_FORMAT_R16G16B16A16_UNORM) ? 1u : 0u;
     constants.write_3d = s_enable_3d ? 1u : 0u;
+    constants.write_depth_eye = s_enable_depth_eye ? 1u : 0u;
 
     if (constants.output_size[0] == 0 || constants.output_size[1] == 0 ||
         constants.velocity_size[0] == 0 || constants.velocity_size[1] == 0 ||
@@ -1781,6 +1872,9 @@ bool D3D12Component::combine_ue_velocity_for_afw(
     // u1: the real 3D target when enabled; else a dummy (u0's UAV). The shader skips the u1 write when Write3D==0.
     command_list->SetComputeRootDescriptorTable(4, s_enable_3d ? output_3d_desc.unorderedAccessViewHandle
                                                                : output_desc.unorderedAccessViewHandle);
+    // u2: the eye-res depth target when enabled; else a dummy (u0's UAV). Shader skips u2 write when WriteDepthEye==0.
+    command_list->SetComputeRootDescriptorTable(5, s_enable_depth_eye ? depth_eye_desc.unorderedAccessViewHandle
+                                                                      : output_desc.unorderedAccessViewHandle);
 
     auto velocity_state = raw_velocity_desc.initialState;
     if (velocity_state == D3D12_RESOURCE_STATE_COMMON) {
@@ -1797,6 +1891,10 @@ bool D3D12Component::combine_ue_velocity_for_afw(
         afw_transition_resource(command_list, output_3d_desc.pTexture, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
+    if (s_enable_depth_eye) {
+        afw_transition_resource(command_list, depth_eye_desc.pTexture, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
 
     command_list->Dispatch((constants.output_size[0] + 7) / 8, (constants.output_size[1] + 7) / 8, 1);
 
@@ -1806,6 +1904,11 @@ bool D3D12Component::combine_ue_velocity_for_afw(
     if (s_enable_3d) {
         afw_uav_barrier(command_list, output_3d_desc.pTexture);
         afw_transition_resource(command_list, output_3d_desc.pTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+    }
+    if (s_enable_depth_eye) {
+        afw_uav_barrier(command_list, depth_eye_desc.pTexture);
+        afw_transition_resource(command_list, depth_eye_desc.pTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                 D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
     }
     if (transition_velocity) {

@@ -7,6 +7,10 @@ RWTexture2D<float2> OutVelocityCombinedTexture : register(u0);
 // PrevDeviceZ (engine per-object value where written, camera reconstruction elsewhere), .w = 0. For
 // PureDark's 3D reprojection (two-frame object tracking) and the "combined Z" debug view.
 RWTexture2D<float4> OutVelocity3DTexture : register(u1);
+// u2: resampled depth at OUTPUT (eye) resolution -> R32_FLOAT. The provider depth is the game's DRS
+// render-scale resolution (smaller than the eye); the combine already resamples it per output pixel, so it
+// also writes that eye-res depth here for PDAFW to warp with (matching its eye color + MV resolution).
+RWTexture2D<float> OutDepthEyeTexture : register(u2);
 
 cbuffer VelocityCombineConstants : register(b0)
 {
@@ -25,7 +29,8 @@ cbuffer VelocityCombineConstants : register(b0)
     uint Write3D;           // 1 = also write the 3D velocity to u1 (opt-in via UEVR_AFW_3D_VELOCITY); 0 = skip
     column_major float4x4 ClipToOtherClip; // this-eye clip -> OTHER-eye clip (current frame) for stereo disparity
     uint CorrectDisparity;  // 1 = subtract the inter-eye disparity from the per-object (encoded) velocity (AFR fix)
-    uint3 _pad;
+    uint WriteDepthEye;     // 1 = also write the resampled eye-res depth to u2 (for PDAFW)
+    uint2 _pad;
 };
 
 uint2 ScaledPixel(uint2 outputPixel, uint2 origin, uint2 extent, uint2 inputSize)
@@ -189,5 +194,11 @@ void VelocityCombineCS(uint3 dispatchThreadId : SV_DispatchThreadID)
     if (Write3D != 0u)                                                       // opt-in 3D output (u1)
     {
         OutVelocity3DTexture[outputPixel] = float4(outVelocity, outVz, 0.0f); // xyz -> RGBA16F (u1)
+    }
+    if (WriteDepthEye != 0u)                                                 // opt-in eye-res depth (u2)
+    {
+        // Resampled (non-dilated) reverse-Z device depth at the eye pixel — PDAFW warps with a depth that
+        // matches the eye color + MV resolution instead of the smaller DRS-res provider depth.
+        OutDepthEyeTexture[outputPixel] = DepthTexture.Load(int3(depthPixel, 0)).x;
     }
 }

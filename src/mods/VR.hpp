@@ -34,6 +34,9 @@ public:
 
     ID3D12Resource* rawDepthTex = NULL;
     ID3D12Resource* rawMotionVectorsTex = NULL;
+    // Latest decoded engine MV that DLSS itself is fed (captured by the NGX EvaluateFeature hook every
+    // frame, regardless of hijack). Diagnostic only: VELDUMP dumps it to compare DLSS's MV vs our combine.
+    ID3D12Resource* afw_dlss_mv_capture = NULL;
 
     TextureDesc uiBufferDesc{};
     TextureDesc depthDesc[2]{{}, {}};

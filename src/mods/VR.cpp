@@ -66,6 +66,9 @@ NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_EvaluateFeature(
         InParameters->Get(NVSDK_NGX_Parameter_Output, &output);
         InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &vr->mvScale[0]);
         InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &vr->mvScale[1]);
+        // Diagnostic: stash the engine MV DLSS is fed so the combine's VELDUMP can dump it for a same-frame
+        // comparison against our combine output (afw_work\dlss_mv_N.bin vs combined_velocity_N.bin).
+        vr->afw_dlss_mv_capture = motionVectors;
         // When the modular frame-resource provider is enabled (UEVR_AFW_FRAME_RESOURCES=1) we want AFW
         // to use OUR depth/velocity + reconstruct-from-depth combine, NOT the buffers DLSS happens to be
         // evaluating with. Grabbing them here (and pre-copying into depthDesc/mvDesc) would set
@@ -78,7 +81,17 @@ NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_EvaluateFeature(
         // requests the DLSS reference instead of our reconstruction. In case (b) on_frame skips the provider
         // copies + combine so the DLSS data we copy here survives to the warp. Flip m_afw_use_dlss_source live
         // to switch between DLSS's ground-truth depth/MV and ours.
-        if (!uevr_afw_bridge::enabled() || vr->afw_use_dlss_source()) {
+        // UEVR_AFW_PREFER_ENGINE_MV=1: on DLSS titles, use the engine's ground-truth depth+MV (the exact
+        // buffers DLSS is fed) for AFW even in the normal provider path. The provider's encoded velocity is
+        // sparse, so the combine reconstructs camera motion from depth, which drifts under motion (RenderDoc
+        // A/B vs DLSS-source confirmed the reconstructed MV is the gap, not the depth). This routes the
+        // dense engine MV straight to PDAFW like the proven 'Use DLSS Depth/MV' reference, but as the
+        // production path. The combine/provider still own non-DLSS builds (this hook never fires there).
+        static const bool s_prefer_engine_mv = []() {
+            const char* e = std::getenv("UEVR_AFW_PREFER_ENGINE_MV");
+            return e != nullptr && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y');
+        }();
+        if (!uevr_afw_bridge::enabled() || vr->afw_use_dlss_source() || s_prefer_engine_mv) {
             vr->rawDepthTex = depth;
             vr->rawMotionVectorsTex = motionVectors;
             EyeIndex nEye = (vr->get_render_frame_count() % 2 == 0) ? EyeLeft : EyeRight;
@@ -239,10 +252,15 @@ std::optional<std::string> VR::initialize_openvr() {
 
     SPDLOG_INFO("[VR] Requested runtime: {}", m_requested_runtime_name->value());
 
-    if (wants_openxr && GetModuleHandleW(L"openxr_loader.dll") != nullptr) {
-        // pre-injected
+    if (wants_openxr) {
+        // The user explicitly requested OpenXR. Do NOT probe OpenVR at all: falling through to
+        // vr::VR_Init(VRApplication_Scene) below auto-launches SteamVR (vrserver/vrmonitor) before
+        // erroring out. openxr_loader.dll is usually not loaded yet at this point, so gating on its
+        // module handle is not enough — skip OpenVR unconditionally when OpenXR is the chosen runtime.
         m_openvr->dll_missing = true;
-        m_openvr->error = "OpenXR already loaded";
+        m_openvr->error = (GetModuleHandleW(L"openxr_loader.dll") != nullptr)
+            ? "OpenXR already loaded"
+            : "OpenXR runtime requested; skipping OpenVR probe";
         return Mod::on_initialize();
     }
 

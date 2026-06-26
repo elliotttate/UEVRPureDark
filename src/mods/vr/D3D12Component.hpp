@@ -104,6 +104,12 @@ private:
     // For PureDark's 3D reprojection + the "combined Z" debug view.
     std::array<TextureDesc, 2> m_combined_velocity_3d_desc{};
 
+    // Per-eye resampled depth at EYE resolution (R32_FLOAT): third combine output (u2). The provider depth
+    // is the game's DRS render-scale resolution (e.g. 1124x1176) while PDAFW warps at the eye resolution
+    // (e.g. 1680x1760). The combine already resamples the depth per output pixel for the MV, so it also
+    // writes that eye-res depth here, and PDAFW warps with a depth that matches its eye color + MV.
+    std::array<TextureDesc, 2> m_afw_depth_eye_desc{};
+
     // AFW debug buffer visualizer pipeline + scratch false-color target.
     ComPtr<ID3D12RootSignature> m_debug_view_root_signature{};
     ComPtr<ID3D12PipelineState> m_debug_view_pso{};
