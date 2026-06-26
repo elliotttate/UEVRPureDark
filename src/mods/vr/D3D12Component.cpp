@@ -997,6 +997,27 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         //}
         EvaluateFrameWarp(params);
 
+        // Keep the per-object source-velocity debug modes (4-8) live even when the combine doesn't run
+        // (engine-MV / DLSS-source paths). The combine is what normally wraps the engine's raw SceneVelocity
+        // into m_raw_velocity_desc; without it those modes freeze on a stale buffer (looks partial / doesn't
+        // update). When a debug view is active and the provider velocity is available, wrap it here for the
+        // current eye -- idempotent (only rebuilds the SRV desc when the texture changes). NOTE the raw
+        // SceneVelocity is sparse + per-OBJECT: camera/head motion is NOT in it (that's the combined-MV mode),
+        // so these modes light up only where objects actually move and stay mostly dark on pure camera motion.
+        if (vr->m_afw_debug_view->value() != 0 && provider_velocity.texture != nullptr) {
+            auto& dbg_vel = m_raw_velocity_desc[nEye];
+            if (dbg_vel.pTexture != provider_velocity.texture || dbg_vel.shaderResourceViewHandle.ptr == 0) {
+                dbg_vel = TextureDesc{};
+                dbg_vel.type = Image;
+                dbg_vel.pTexture = provider_velocity.texture;
+                dbg_vel.initialState = static_cast<D3D12_RESOURCE_STATES>(provider_velocity.view.expected_state);
+                if (dbg_vel.initialState == D3D12_RESOURCE_STATE_COMMON) {
+                    dbg_vel.initialState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                }
+                vr->d3d12Renderer->SetupTextureDesc(dbg_vel);
+            }
+        }
+
         // AFW debug buffer visualizer (Unreal menu -> Alternate Frame Warping -> Debug Buffer View).
         // False-colors the depth / motion vectors AFW consumes and blits over the submitted eye.
         if (const int afw_debug_view = vr->m_afw_debug_view->value(); afw_debug_view != 0) {
