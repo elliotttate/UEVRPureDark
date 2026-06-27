@@ -19,11 +19,14 @@ $ErrorActionPreference = "Stop"
 $exe = Join-Path $Win64Dir "b1-Win64-Shipping.exe"
 function Assert-File([string]$p,[string]$l){ if(-not(Test-Path -LiteralPath $p -PathType Leaf)){ throw "$l not found: $p" } }
 function Set-ConfigValue([string]$Path,[string]$Key,[string]$Value){
-    $lines=@(); if(Test-Path -LiteralPath $Path){ $lines=@(Get-Content -LiteralPath $Path) }
+    # @(...) forces an ARRAY so the not-found append is array-append, not string concatenation
+    # (the bug that joined every key=value onto one line -> UEVR tried OpenVR + disabled AFW).
+    $lines=@()
+    if(Test-Path -LiteralPath $Path){ $lines=@([IO.File]::ReadAllText($Path) -split "`r`n|`n|`r" | Where-Object { $_ -ne '' }) }
     $pat="^{0}=" -f [regex]::Escape($Key); $rep=$false
-    $out=foreach($l in $lines){ if($l -match $pat){ $rep=$true; "$Key=$Value" } else { $l } }
+    $out=@(foreach($l in $lines){ if($l -match $pat){ $rep=$true; "$Key=$Value" } else { $l } })
     if(-not $rep){ $out+="$Key=$Value" }
-    $out | Set-Content -LiteralPath $Path -Encoding ASCII
+    [IO.File]::WriteAllText($Path, (($out -join "`n") + "`n"))
 }
 function Copy-IfDifferent([string]$s,[string]$d,[string]$l){
     if(-not(Test-Path -LiteralPath $s)){ Write-Warning "$l missing: $s"; return }
@@ -72,6 +75,7 @@ $envBlock = [ordered]@{
     UEVR_AFW_DERIVED_PROJECTIONS               = "1"
     UEVR_AFW_FULL_SOURCE_VIEWPORT              = "0"
     UEVR_AFW_PREFILL_WARP_OUTPUT               = "1"
+    UEVR_AFW_PREFER_ENGINE_MV                  = "1"
 }
 foreach($k in $envBlock.Keys){ Set-Item -Path "Env:$k" -Value ([string]$envBlock[$k]) }
 

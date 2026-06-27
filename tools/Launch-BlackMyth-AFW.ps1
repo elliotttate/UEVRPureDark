@@ -25,11 +25,16 @@ $ErrorActionPreference = "Stop"
 
 function Assert-File([string]$p,[string]$label){ if(-not (Test-Path -LiteralPath $p -PathType Leaf)){ throw "$label not found: $p" } }
 function Set-ConfigValue([string]$Path,[string]$Key,[string]$Value){
-    $lines = @(); if(Test-Path -LiteralPath $Path){ $lines = @(Get-Content -LiteralPath $Path) }
+    # Read raw + split on ANY line ending so a stray \r-only or missing-trailing-newline file
+    # never collapses into one "line". @(...) around the loop forces an ARRAY, so the not-found
+    # append below is an array-append, NOT a string concatenation (the bug that joined every
+    # key=value onto the Frontend_RequestedRuntime line and made UEVR try OpenVR + disable AFW).
+    $lines = @()
+    if(Test-Path -LiteralPath $Path){ $lines = @([IO.File]::ReadAllText($Path) -split "`r`n|`n|`r" | Where-Object { $_ -ne '' }) }
     $pattern = "^{0}=" -f [regex]::Escape($Key); $replaced=$false
-    $out = foreach($l in $lines){ if($l -match $pattern){ $replaced=$true; "$Key=$Value" } else { $l } }
+    $out = @(foreach($l in $lines){ if($l -match $pattern){ $replaced=$true; "$Key=$Value" } else { $l } })
     if(-not $replaced){ $out += "$Key=$Value" }
-    $out | Set-Content -LiteralPath $Path -Encoding ASCII
+    [IO.File]::WriteAllText($Path, (($out -join "`n") + "`n"))
 }
 function Copy-IfDifferent([string]$src,[string]$dst,[string]$label){
     if(-not (Test-Path -LiteralPath $src)){ Write-Warning "$label source missing: $src"; return }
@@ -133,6 +138,7 @@ $envBlock = [ordered]@{
     UEVR_AFW_FULL_SOURCE_VIEWPORT               = "0"
     UEVR_AFW_PREFILL_WARP_OUTPUT                = "1"
     UEVR_AFW_PREFER_ENGINE_MV                   = "1"
+    UEVR_AFW_VELDUMP                            = "1"
 }
 
 # Optional: late-load renderdoc.dll + bootstrap the in-app API so the backend's capture watcher
