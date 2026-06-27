@@ -705,6 +705,17 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     bool using_provider_depth = false;
     bool using_provider_velocity = false;
 
+    // Per-object velocity DEBUG source. Snapshot the provider scene-velocity HERE -- before the encoded-SVE
+    // override further down can repoint provider_velocity at the engine's 0.5-encoded RGBA16_UNORM buffer
+    // (which the combine decodes, but the per-object debug shader reads raw.xy and cannot). Only accept the
+    // RAW R16G16_FLOAT variant; on the encoded frames the engine alternates in, leave the last raw buffer in
+    // place (m_raw_velocity_desc persists) so the per-object modes (4-8) show a stable raw scene-velocity
+    // field in EVERY path, including engine-MV where provider_velocity gets overridden for the warp.
+    const AfwProviderResource raw_scene_velocity_for_debug = provider_velocity;
+    const bool raw_scene_velocity_for_debug_ok =
+        provider_velocity_valid && raw_scene_velocity_for_debug.texture != nullptr &&
+        static_cast<DXGI_FORMAT>(raw_scene_velocity_for_debug.view.format) == DXGI_FORMAT_R16G16_FLOAT;
+
     // Only accept eye-resolution provider buffers. The engine also renders a smaller desktop-spectator
     // view (e.g. 1004x628) at a different FOV/aspect; feeding that to AFW (which warps the per-eye
     // 1680x1760 image) misregisters the depth / motion-vector field. Require at least the eye size.
@@ -974,7 +985,15 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                         std::snprintf(ep, sizeof(ep), "E:\\Github\\UEVRPureDark\\afw_work\\eng_mvdesc_%d.bin", en);
                         afw_dump_texture_to_disk(edev, eq, vr->motionVectorsDesc[nEye].pTexture, vr->motionVectorsDesc[nEye].initialState, ep);
                     }
-                    SPDLOG_INFO("[VR] ENGINE-MV DUMP #{} eye={} combinedVel={}", en, static_cast<int>(nEye), combined_velocity ? 1 : 0);
+                    // The EXACT buffer the per-object debug modes (4-8) sample: the raw provider SceneVelocity
+                    // wrapped into m_raw_velocity_desc. This is what must (or must not) carry the character's
+                    // per-object velocity -- dump it straight so we can see numerically what those modes show.
+                    if (m_raw_velocity_desc[nEye].pTexture != nullptr) {
+                        std::snprintf(ep, sizeof(ep), "E:\\Github\\UEVRPureDark\\afw_work\\perobj_velocity_%d.bin", en);
+                        afw_dump_texture_to_disk(edev, eq, m_raw_velocity_desc[nEye].pTexture, m_raw_velocity_desc[nEye].initialState, ep);
+                    }
+                    SPDLOG_INFO("[VR] ENGINE-MV DUMP #{} eye={} combinedVel={} perObjTex={}", en, static_cast<int>(nEye), combined_velocity ? 1 : 0,
+                                m_raw_velocity_desc[nEye].pTexture != nullptr ? 1 : 0);
                 }
                 if (edev != nullptr) edev->Release();
             }
@@ -1000,17 +1019,19 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         // Keep the per-object source-velocity debug modes (4-8) live even when the combine doesn't run
         // (engine-MV / DLSS-source paths). The combine is what normally wraps the engine's raw SceneVelocity
         // into m_raw_velocity_desc; without it those modes freeze on a stale buffer (looks partial / doesn't
-        // update). When a debug view is active and the provider velocity is available, wrap it here for the
-        // current eye -- idempotent (only rebuilds the SRV desc when the texture changes). NOTE the raw
-        // SceneVelocity is sparse + per-OBJECT: camera/head motion is NOT in it (that's the combined-MV mode),
-        // so these modes light up only where objects actually move and stay mostly dark on pure camera motion.
-        if (vr->m_afw_debug_view->value() != 0 && provider_velocity.texture != nullptr) {
+        // update). Wrap the RAW R16G16_FLOAT scene-velocity snapshot (taken above, before the encoded-SVE
+        // override) for the current eye so the per-object modes sample the engine's real per-object velocity
+        // in every path -- NOT the dense engine MV the warp consumes, nor the combine's encoded input. This
+        // also runs in the combine path AFTER the combine has read m_raw_velocity_desc, repointing the debug
+        // view at the raw field. Idempotent (only rebuilds the SRV desc when the texture changes); skipping
+        // the encoded frames holds the last raw buffer so the view stays stable instead of flickering garbage.
+        if (vr->m_afw_debug_view->value() != 0 && raw_scene_velocity_for_debug_ok) {
             auto& dbg_vel = m_raw_velocity_desc[nEye];
-            if (dbg_vel.pTexture != provider_velocity.texture || dbg_vel.shaderResourceViewHandle.ptr == 0) {
+            if (dbg_vel.pTexture != raw_scene_velocity_for_debug.texture || dbg_vel.shaderResourceViewHandle.ptr == 0) {
                 dbg_vel = TextureDesc{};
                 dbg_vel.type = Image;
-                dbg_vel.pTexture = provider_velocity.texture;
-                dbg_vel.initialState = static_cast<D3D12_RESOURCE_STATES>(provider_velocity.view.expected_state);
+                dbg_vel.pTexture = raw_scene_velocity_for_debug.texture;
+                dbg_vel.initialState = static_cast<D3D12_RESOURCE_STATES>(raw_scene_velocity_for_debug.view.expected_state);
                 if (dbg_vel.initialState == D3D12_RESOURCE_STATE_COMMON) {
                     dbg_vel.initialState = D3D12_RESOURCE_STATE_RENDER_TARGET;
                 }
